@@ -1,0 +1,2507 @@
+---
+title: "Partitioning paper analysis & plotting"
+author: "Eduardo Gamez Jr & Dr. Sara Knox"
+date: "2025-11-12"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(vroom)
+  library(lubridate)
+  library(glue)
+  library(broom)
+  library(Metrics)
+  library(grid)
+  library(ggplot2)
+  library(readxl)
+  library(dplyr)
+  library(purrr)
+  library(broom)
+  library(here)
+  library(stringr)
+  library(readr)
+})
+
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+options(stringsAsFactors = FALSE, scipen = 999)
+
+## REMOVE time stamp from figure and table names!
+```
+
+```{r paths-helpers}
+# --- Paths (edit base_dir to your repo path if needed) ---
+base_dir <- "/Users/saraknox/Code/nee-partition"
+#base_dir <- "C:/Users/Eddie/Documents/GitHub/nee-partition-main"
+pred_dir <- file.path(base_dir, "model_predictions")
+data_dir <- file.path(base_dir, "data")
+
+# --- Helpers ---
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
+site_key <- function(x) toupper(gsub('[^A-Za-z0-9]', '', x %||% ''))
+
+parse_site_method <- function(path) {
+  stem  <- tools::file_path_sans_ext(basename(path))
+  parts <- strsplit(stem, '_', fixed = TRUE)[[1]]
+  site  <- parts[1] %||% NA_character_
+  list(SITE = site, SITE_KEY = site_key(site), METHOD = parts[2] %||% NA_character_)
+}
+
+extract_site_from_cleaned <- function(path) {
+  nm <- basename(path)
+  m  <- regexec('^Cleaned_([-A-Za-z0-9]+)_nee_partition_', nm, perl = TRUE)
+  hit <- regmatches(nm, m)[[1]]
+  if (length(hit) >= 2) hit[2] else NA_character_
+}
+
+add_missing_cols <- function(df, all_names) {
+  missing <- setdiff(all_names, names(df))
+  if (length(missing)) df[missing] <- NA
+  df[all_names]
+}
+
+parse_meta <- function(f) {
+  stem <- tools::file_path_sans_ext(basename(f))
+  msite <- regexec('^Cleaned_([-A-Za-z0-9]+)_nee_partition_', stem, perl = TRUE)
+  hsite <- regmatches(stem, msite)[[1]]
+  site  <- if (length(hsite) >= 2) hsite[2] else extract_site_from_cleaned(f)
+  digs <- regmatches(stem, gregexpr('([0-9]{12,14})', stem, perl = TRUE))[[1]]
+  s1 <- if (length(digs) >= 1) digs[1] else NA_character_
+  s2 <- if (length(digs) >= 2) digs[2] else NA_character_
+  parse_stamp <- function(s) {
+    if (is.na(s)) return(as.POSIXct(NA))
+    fmt <- if (nchar(s) == 12) '%Y%m%d%H%M' else if (nchar(s) == 14) '%Y%m%d%H%M%S' else NA_character_
+    if (is.na(fmt)) return(as.POSIXct(NA))
+    as.POSIXct(s, format = fmt, tz = 'UTC')
+  }
+  start_dt <- parse_stamp(s1); end_dt <- parse_stamp(s2)
+  y1 <- if (!is.na(s1)) substr(s1, 1, 4) else NA_character_
+  y2 <- if (!is.na(s2)) substr(s2, 1, 4) else NA_character_
+  variant <- if (!is.na(y1) && !is.na(y2)) sprintf('%s_%s-%s', site, y1, y2) else site
+  tibble(.source_norm=f, SITE_BASE=site, SITE_KEY=site_key(site), SITE_PLOT=variant, start_dt=start_dt, end_dt=end_dt)
+}
+
+parse_pred_meta <- function(f) {
+  stem <- tools::file_path_sans_ext(basename(f))
+  site <- sub('_.+$', '', stem)
+  key  <- site_key(site)
+  method_guess <- if (grepl('tramontana', stem, ignore.case = TRUE)) 'Tramontana' else if (grepl('custom', stem, ignore.case = TRUE)) 'Custom' else NA_character_
+  m <- regexec('^[^_]+_([0-9]{4})-([0-9]{4})(?:_|$)', stem, perl = TRUE)
+  h <- regmatches(stem, m)[[1]]
+  if (length(h) >= 3) {
+    y1 <- h[2]; y2 <- h[3]
+    return(tibble(.source_file=f, SITE_FILE=site, SITE_KEY=key, METHOD_FILE=method_guess, SITE_PLOT_PRE=sprintf('%s_%s-%s', site, y1, y2)))
+  }
+  digs <- regmatches(stem, gregexpr('([0-9]{12,14})', stem, perl = TRUE))[[1]]
+  if (length(digs) >= 2) {
+    y1 <- substr(digs[1], 1, 4); y2 <- substr(digs[2], 1, 4)
+    return(tibble(.source_file=f, SITE_FILE=site, SITE_KEY=key, METHOD_FILE=method_guess, SITE_PLOT_PRE=sprintf('%s_%s-%s', site, y1, y2)))
+  }
+  tibble(.source_file=f, SITE_FILE=site, SITE_KEY=key, METHOD_FILE=method_guess, SITE_PLOT_PRE=NA_character_)
+}
+```
+
+```{r read-preds}
+# --- Read TRAMONTANA predictions ---
+pred_files <- list.files(pred_dir, full.names = TRUE, recursive = TRUE)
+pred_files <- pred_files[tolower(tools::file_ext(pred_files)) == 'csv']
+if (!length(pred_files)) stop('No CSV files found in: ', pred_dir, ' (searched recursively).')
+
+pred_meta_tbl <- purrr::map_dfr(pred_files, parse_pred_meta)
+
+pred_list <- lapply(pred_files, function(f) {
+  parsed <- parse_site_method(f)
+  meta   <- pred_meta_tbl %>% filter(.source_file == f) %>% slice_tail(n=1)
+  df <- vroom::vroom(f, delim = ',', col_types = vroom::cols(.default = vroom::col_guess()), .name_repair = 'minimal')
+  method_from_name <- meta$METHOD_FILE %||% parsed$METHOD
+  df$METHOD <- method_from_name %||% df$METHOD
+  df$SITE   <- df$SITE %||% parsed$SITE
+  df$SITE_KEY <- site_key(df$SITE)
+  df$SITE_PLOT_PRE <- meta$SITE_PLOT_PRE %||% NA_character_
+  df$.source_file <- f
+  df %>% relocate(SITE, SITE_KEY, METHOD, SITE_PLOT_PRE, .source_file, .before = 1)
+})
+
+all_pred_names <- Reduce(union, lapply(pred_list, names))
+model_predictions <- pred_list %>%
+  lapply(add_missing_cols, all_names = all_pred_names) %>%
+  bind_rows() %>%
+  filter(tolower(METHOD) == 'tramontana')
+
+if (!nrow(model_predictions)) stop('No Tramontana rows found in model_predictions.')
+```
+
+```{r read-norm}
+# --- Read cleaned data ---
+data_files <- list.files(data_dir, full.names = TRUE, recursive = TRUE)
+data_files <- data_files[tolower(tools::file_ext(data_files)) == 'csv' & grepl('^Cleaned_', basename(data_files), ignore.case = TRUE)]
+if (!length(data_files)) stop('No cleaned files found in: ', data_dir, ' (searched recursively).')
+
+meta   <- purrr::map_dfr(data_files, parse_meta)
+variant_tbl <- meta %>% distinct(SITE_BASE, SITE_KEY, SITE_PLOT, start_dt, end_dt)
+
+read_one <- function(f) {
+  df <- vroom::vroom(f, delim = ',', col_types = vroom::cols(.default = vroom::col_guess()), .name_repair = 'minimal')
+  meta <- parse_meta(f)
+  df$SITE         <- meta$SITE_BASE[1]
+  df$SITE_KEY     <- meta$SITE_KEY[1]
+  df$SITE_PLOT    <- meta$SITE_PLOT[1]
+  df$.source_norm <- f
+  df
+}
+all <- purrr::map_dfr(data_files, read_one)
+
+if (!'TIME' %in% names(all)) stop('TIME column not found in datasets.')
+
+if (!is.numeric(all$TIME))
+  all$TIME <- suppressWarnings(as.numeric(all$TIME))
+all$TIME[!(is.finite(all$TIME) & all$TIME >= 0 & all$TIME <= 24)] <- NA_real_
+
+chron_cols <- c('Year','Month','Day','TIME')
+if (all(chron_cols %in% names(all))) {
+  all <- all %>% arrange(SITE_PLOT, Year, Month, Day, TIME)
+} else {
+  all <- all %>%
+    group_by(SITE_PLOT, .source_norm) %>% mutate(.row_in_file = row_number()) %>% ungroup() %>%
+    arrange(SITE_PLOT, .source_norm, .row_in_file)
+}
+
+time_map <- all %>%
+  group_by(SITE_PLOT) %>%
+  mutate(variant_row = row_number()) %>%
+  ungroup()
+
+# Keep TIME plus any extra state variables we care about from the normalized files
+keep_core   <- c('SITE_PLOT', 'variant_row', 'TIME')
+extra_state <- intersect(c('WTD', 'Salinity', 'TA'), names(time_map))
+
+time_map <- time_map %>%
+  dplyr::select(dplyr::all_of(keep_core), dplyr::all_of(extra_state)) %>%
+  dplyr::rename(TIME_hour = TIME)
+```
+
+```{r assign-variant-early}
+# --- Assign SITE_PLOT to predictions ---
+vt <- variant_tbl %>%
+  filter(!is.na(start_dt), !is.na(end_dt)) %>%
+  mutate(start_date = as.Date(start_dt), end_date = as.Date(end_dt))
+
+mp0 <- model_predictions %>%
+  mutate(.row_id = dplyr::row_number()) %>%
+  mutate(Year=as.integer(Year), Month=as.integer(Month), Day=as.integer(Day),
+         DATE_ONLY = suppressWarnings(as.Date(sprintf('%04d-%02d-%02d', Year, Month, Day))))
+
+has_pre <- !is.na(mp0$SITE_PLOT_PRE) & mp0$SITE_PLOT_PRE != ''
+
+mp_B <- mp0 %>%
+  filter(!has_pre & !is.na(DATE_ONLY)) %>%
+  inner_join(vt %>% mutate(SITE_KEY = site_key(SITE_BASE)), by = c('SITE_KEY')) %>%
+  filter(DATE_ONLY >= start_date & DATE_ONLY <= end_date) %>%
+  mutate(window_days = as.numeric(difftime(end_date, start_date, units = 'days')))
+
+best_B <- mp_B %>%
+  group_by(.row_id) %>%
+  arrange(window_days, end_date, SITE_PLOT, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup()
+
+pred_assigned <- mp0 %>%
+  left_join(best_B %>% select(.row_id, SITE_PLOT), by = '.row_id') %>%
+  mutate(SITE_PLOT = dplyr::coalesce(SITE_PLOT_PRE, SITE_PLOT, SITE)) %>%
+  mutate(SITE = SITE_PLOT)
+```
+
+```{r attach-time-variant}
+# --- Attach variant index & join TIME ---
+has_chron <- all(c('Year','Month','Day') %in% names(pred_assigned))
+if (has_chron) {
+  pred_indexed <- pred_assigned %>%
+    arrange(SITE_PLOT, Year, Month, Day) %>%
+    group_by(SITE_PLOT) %>%
+    mutate(variant_row = row_number()) %>%
+    ungroup()
+} else {
+  pred_indexed <- pred_assigned %>%
+    group_by(SITE_PLOT, .source_file) %>% mutate(.row_in_file = row_number()) %>% ungroup() %>%
+    arrange(SITE_PLOT, .source_file, .row_in_file) %>%
+    group_by(SITE_PLOT) %>% mutate(variant_row = row_number()) %>% ungroup() %>%
+    select(-any_of('.row_in_file'))
+}
+
+if (!'TIME' %in% names(pred_indexed)) pred_indexed$TIME <- NA_real_
+model_predictions <- pred_indexed %>% left_join(time_map, by = c('SITE_PLOT','variant_row'))
+```
+
+```{r build-timestamp}
+# --- Build TIMESTAMP ---
+model_predictions <- model_predictions %>%
+  mutate(Year=as.integer(Year), Month=as.integer(Month), Day=as.integer(Day))
+
+if ('TIME' %in% names(model_predictions) && inherits(model_predictions$TIME, 'POSIXct')) {
+  model_predictions <- model_predictions %>%
+    mutate(Hour_num = lubridate::hour(TIME),
+           Minute_num = lubridate::minute(TIME))
+} else {
+  if ('TIME' %in% names(model_predictions)) {
+    tt_pred_raw <- suppressWarnings(as.numeric(model_predictions$TIME))
+    valid_pred <- is.finite(tt_pred_raw) & tt_pred_raw >= 0 & tt_pred_raw <= 24
+    tt_pred <- ifelse(valid_pred, tt_pred_raw, NA_real_)
+  } else {
+    tt_pred <- rep(NA_real_, nrow(model_predictions))
+  }
+  time_hour <- dplyr::coalesce(tt_pred, model_predictions$TIME_hour)
+  model_predictions$Hour_num   <- ifelse(is.finite(time_hour), floor(time_hour), NA_real_)
+  model_predictions$Minute_num <- ifelse(is.finite(time_hour), round((time_hour - floor(time_hour))*60), NA_real_)
+}
+
+model_predictions <- model_predictions %>%
+  mutate(
+    Hour_num   = ifelse(is.finite(Hour_num) & Hour_num >= 0 & Hour_num <= 23, Hour_num, NA_real_),
+    Minute_num = ifelse(is.finite(Minute_num) & Minute_num >= 0 & Minute_num <= 59, Minute_num, NA_real_)
+  ) %>%
+  mutate(
+    Month_str  = sprintf('%02d', pmax(1, pmin(12, as.integer(Month)))),
+    Day_str    = sprintf('%02d', pmax(1, pmin(31, as.integer(Day)))),
+    Hour_str   = sprintf('%02d', ifelse(is.finite(Hour_num), as.integer(Hour_num), 0L)),
+    Minute_str = sprintf('%02d', ifelse(is.finite(Minute_num), as.integer(Minute_num), 0L)),
+    TIMESTAMP_chr = paste0(Year, Month_str, Day_str, ' ', Hour_str, ':', Minute_str),
+    TIMESTAMP = suppressWarnings(as.POSIXct(TIMESTAMP_chr, format = '%Y%m%d %H:%M', tz = 'UTC'))
+  )
+```
+
+```{r nighttime-best}
+# --- NIGHTTIME BEST (BASE = e11 enforced) ---
+required_cols <- c('SITE','METHOD','NEE_RAW','SW_IN_RAW')
+missing_req   <- setdiff(required_cols, names(model_predictions))
+if (length(missing_req)) stop('Missing required columns in model_predictions: ', paste(missing_req, collapse = ', '))
+
+reco_cols <- grep('^e[0-9]+_RECO$', names(model_predictions), value = TRUE)
+if (!length(reco_cols)) stop("No modeled RECO columns found (expected '^e[0-9]+_RECO$').")
+
+df_night <- model_predictions %>%
+  filter(SW_IN_RAW < 10) %>%
+  select(SITE, METHOD, TIMESTAMP, NEE_RAW, all_of(reco_cols)) %>%
+  pivot_longer(cols = all_of(reco_cols), names_to = 'run', values_to = 'Reco') %>%
+  drop_na(NEE_RAW, Reco)
+
+fit_stats <- function(df) {
+  if (nrow(df) < 3 || var(df$Reco, na.rm = TRUE) == 0)
+    return(tibble(intercept = NA_real_, slope = NA_real_, r2 = NA_real_, rmse = NA_real_, n = nrow(df)))
+  fit <- try(lm(NEE_RAW ~ Reco, data = df), silent = TRUE)
+  if (inherits(fit, 'try-error'))
+    return(tibble(intercept = NA_real_, slope = NA_real_, r2 = NA_real_, rmse = NA_real_, n = nrow(df)))
+  preds <- predict(fit, newdata = df)
+  tibble(
+    intercept = unname(coef(fit)[1]),
+    slope     = unname(coef(fit)[2]),
+    r2        = summary(fit)$r.squared,
+    rmse      = Metrics::rmse(df$NEE_RAW, preds),
+    n         = nrow(df)
+  )
+}
+
+model_results <- df_night %>%
+  group_by(SITE, METHOD, run) %>%
+  group_modify(~ fit_stats(.x)) %>%
+  ungroup()
+
+best_run_by_site <- c(
+  "CADSM" = "e11",
+  "USEDN" = "e11",
+  "USDMG" = "e12",
+  "USSRR" = "e12",
+  "USSTJ" = "e15",
+  "CARBM" = "e12",
+  "USPLM" = "e12",
+  "USPLO" = "e11"
+)
+
+best_models <- model_results %>%
+  mutate(
+    SITE    = as.character(SITE),
+    Site_ID = toupper(str_replace(SITE, "_.*$", "")),
+    run_lc  = tolower(as.character(run))
+  ) %>%
+  mutate(
+    best_e        = unname(best_run_by_site[Site_ID]),      # e11, e12, …
+    best_run      = paste0(best_e, "_RECO"),                # e11_RECO (OLD-style)
+    best_run_lc   = tolower(best_run)
+  ) %>%
+  {
+    # Fail fast if mapping missing
+    unmapped <- unique(.$Site_ID[is.na(.$best_e)])
+    if (length(unmapped)) {
+      stop("No best-run mapping for site(s): ",
+           paste(unmapped, collapse = ", "))
+    }
+    .
+  } %>%
+  filter(
+    METHOD == "Tramontana",
+    run_lc == best_run_lc
+  ) %>%
+  {
+    # Fail fast if expected best run is missing
+    expected_sites <- names(best_run_by_site)
+    missing_sites  <- setdiff(expected_sites, unique(.$Site_ID))
+    if (length(missing_sites)) {
+      stop(
+        "Missing expected BEST RECO rows for site(s): ",
+        paste(missing_sites, collapse = ", "),
+        ". Expected runs: ",
+        paste0(missing_sites, "=", best_run_by_site[missing_sites], "_RECO",
+               collapse = "; ")
+      )
+    }
+    .
+  } %>%
+  transmute(
+    SITE,
+    Site_ID,
+    METHOD,
+    best_e,            # e11 / e12 / e15  (for wide-column extraction)
+    best_run,          # e11_RECO         (matches OLD code semantics)
+    intercept,
+    slope,
+    r2,
+    rmse,
+    n
+  )
+
+# Choose BEST by highest R^2, then lowest RMSE, then slope closest to 1 - OLD
+#best_models <- model_results %>%
+#  group_by(SITE, METHOD) %>%
+#  arrange(desc(r2), rmse, abs(1 - slope), .by_group = TRUE) %>%
+#  slice(1) %>%
+#  ungroup() %>%
+#  rename(best_run = run)
+
+# alias if later code calls safe_fit()
+safe_fit <- fit_stats
+```
+
+```{r bestmodel-extract}
+# --- BESTMODEL & BASE EXTRACTION (BASE = e11) ---
+gpp_cols  <- grep('^e[0-9]+_GPP$',  names(model_predictions), value = TRUE)
+nee_cols  <- grep('^e[0-9]+_NEE$',  names(model_predictions), value = TRUE)
+reco_cols <- grep('^e[0-9]+_RECO$', names(model_predictions), value = TRUE)
+
+pred_best <- model_predictions %>% left_join(best_models, by = c('SITE','METHOD'))
+
+# Pull per-row BEST columns from the chosen run
+reco_mat <- as.matrix(pred_best[, reco_cols, drop = FALSE])
+idx_reco_col <- match(pred_best$best_run, colnames(reco_mat))
+bestmodel_RECO <- rep(NA_real_, nrow(pred_best))
+valid_reco <- !is.na(idx_reco_col)
+if (any(valid_reco)) bestmodel_RECO[valid_reco] <- reco_mat[cbind(which(valid_reco), idx_reco_col[valid_reco])]
+
+bestmodel_GPP <- bestmodel_NEE <- rep(NA_real_, nrow(pred_best))
+
+if (length(gpp_cols)) {
+  gpp_mat <- as.matrix(pred_best[, gpp_cols, drop = FALSE])
+  idx_gpp_col <- match(sub('_RECO$', '_GPP', pred_best$best_run), colnames(gpp_mat))
+  valid_gpp <- !is.na(idx_gpp_col)
+  if (any(valid_gpp)) bestmodel_GPP[valid_gpp] <- gpp_mat[cbind(which(valid_gpp), idx_gpp_col[valid_gpp])]
+}
+if (length(nee_cols)) {
+  nee_mat <- as.matrix(pred_best[, nee_cols, drop = FALSE])
+  idx_nee_col <- match(sub('_RECO$', '_NEE', pred_best$best_run), colnames(nee_mat))
+  valid_nee <- !is.na(idx_nee_col)
+  if (any(valid_nee)) bestmodel_NEE[valid_nee] <- nee_mat[cbind(which(valid_nee), idx_nee_col[valid_nee])]
+}
+
+pred_best <- pred_best %>%
+  mutate(
+    bestmodel_RECO = bestmodel_RECO,
+    bestmodel_GPP  = bestmodel_GPP,
+    bestmodel_NEE  = bestmodel_NEE
+  )
+
+# --- BASE TRAMONTANA: must be e11; fail fast if missing ---
+required_e11 <- c('e11_RECO','e11_GPP','e11_NEE')
+missing_e11  <- setdiff(required_e11, names(pred_best))
+if (length(missing_e11))
+  stop('BASE (e11) columns are missing: ', paste(missing_e11, collapse = ', '))
+
+pred_best <- pred_best %>%
+  mutate(
+    BASE_TRAMONTANA_RECO = e11_RECO,
+    BASE_TRAMONTANA_GPP  = e11_GPP,
+    BASE_TRAMONTANA_NEE  = e11_NEE
+  )
+
+# Working data for downstream plots/exports
+df_subset <- pred_best
+
+# Drop USEDN_2020-2021
+df_subset <- df_subset %>%
+  filter(SITE != "USEDN_2020-2021")
+```
+
+```{r plot-night, fig.width=12, fig.height=7}
+
+# --- Nighttime scatter fits: BEST vs DT/NT and BASE vs DT/NT ---
+req <- c('SITE','METHOD','SW_IN_RAW','NEE_RAW','bestmodel_RECO','BASE_TRAMONTANA_RECO','TIMESTAMP')
+miss <- setdiff(req, names(df_subset)); if (length(miss)) stop('df_subset missing required columns: ', paste(miss, collapse=', '))
+present_dtnt <- intersect(c('DT_RECO','NT_RECO'), names(df_subset))
+
+df_night2 <- df_subset %>% filter(is.finite(SW_IN_RAW), SW_IN_RAW < 10) %>% drop_na(NEE_RAW)
+
+dt_nt_long <- if (length(present_dtnt)) {
+  df_night2 %>% arrange(SITE, TIMESTAMP) %>% group_by(SITE, TIMESTAMP) %>% slice(1) %>% ungroup() %>%
+    select(SITE, TIMESTAMP, NEE_RAW, all_of(present_dtnt)) %>%
+    pivot_longer(cols = all_of(present_dtnt), names_to = 'series', values_to = 'Reco')
+} else {
+  tibble(SITE=character(), TIMESTAMP=as.POSIXct(character()), NEE_RAW=double(), series=character(), Reco=double())
+}
+
+best_tram <- df_night2 %>% transmute(SITE, TIMESTAMP, NEE_RAW, series = 'Tramontana_bestmodel_RECO', Reco = bestmodel_RECO)
+base_tram <- df_night2 %>% transmute(SITE, TIMESTAMP, NEE_RAW, series = 'BASE_TRAMONTANA_RECO',    Reco = BASE_TRAMONTANA_RECO)
+
+# ---------------------- BEST vs DT/NT ----------------------
+plot_base_best <- bind_rows(dt_nt_long, best_tram) %>% drop_na(Reco, NEE_RAW)
+
+# Rename sites
+plot_base_best <- plot_base_best %>%
+  dplyr::mutate(
+    SITE = gsub("_.*", "", SITE),                     # remove _dates
+    SITE = paste0(
+      substr(SITE, 1, 2), "-",                        # first 2 letters
+      substr(SITE, nchar(SITE) - 2, nchar(SITE))      # last 3 letters
+    )
+  )
+
+# Load site data so that site names match AmeriFlux naming convention
+df_site_info <- read_excel(here::here("data", "Site characteristics final.xlsx"))
+
+# Make a lookup from upper-case code -> original Site_ID
+site_id_lookup <- df_site_info %>%
+  mutate(SITE_UPPER = toupper(Site_ID)) %>%
+  select(SITE_UPPER, Site_ID)
+
+# Replace SITE in plot_base_best with the exact Site_ID strings
+plot_base_best <- plot_base_best %>%
+  mutate(SITE_UPPER = toupper(SITE)) %>%           # key in same format
+  left_join(site_id_lookup, by = "SITE_UPPER") %>% # bring in Site_ID
+  mutate(SITE = Site_ID) %>%                       # overwrite SITE
+  select(-SITE_UPPER, -Site_ID)                    # drop helper cols
+
+model_results_best <- plot_base_best %>%
+  group_by(SITE, series) %>%
+  group_modify(~safe_fit(.x %>% rename(Reco = Reco, NEE_RAW = NEE_RAW))) %>%
+  ungroup() %>%
+  mutate(equation = sprintf('NEE = %.2f + %.2f x\nR² = %.2f  RMSE = %.2f', intercept, slope, r2, rmse))
+
+plot_data_best <- left_join(plot_base_best, model_results_best, by = c('SITE','series'))
+
+p_best <- ggplot(plot_data_best, aes(x = Reco, y = NEE_RAW)) +
+  geom_point(color = "black", alpha = 0.35) +
+  geom_smooth(aes(color = series), method = "lm", se = FALSE) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ SITE, scales = "free") +
+  scale_color_manual(
+    values = c(
+      "DT_RECO" = "#2ca02c",
+      "NT_RECO" = "#9467bd",
+      "Tramontana_bestmodel_RECO" = "#1f77b4"
+    ),
+    labels = c(
+      "DT_RECO" = "Daytime",
+      "NT_RECO" = "Nighttime",
+      "Tramontana_bestmodel_RECO" = expression(ANN[BEST])
+    )
+  ) +
+  labs(
+    title = NULL,
+    color = NULL,
+    x = expression("Modeled RECO"["night"]~(mu*mol~m^{-2}~s^{-1})),
+    y = expression("Measured NEE"["night"]~(mu*mol~m^{-2}~s^{-1})),
+    color = "Series"
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+ggsave(
+  filename = here::here("figures", "Nighttime_NEE_vs_Reco_bySite_BEST.png"),
+  plot = p_best,
+  width = 12,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+readr::write_csv(
+  model_results_best %>% arrange(SITE, desc(r2)),
+  here::here("output", "Nighttime_NEE_vs_Reco_stats_BEST.csv")
+)
+
+# ---------------------- BASE vs DT/NT ----------------------
+plot_base_base <- bind_rows(dt_nt_long, base_tram) %>% drop_na(Reco, NEE_RAW)
+
+model_results_base <- plot_base_base %>%
+  group_by(SITE, series) %>%
+  group_modify(~safe_fit(.x %>% rename(Reco = Reco, NEE_RAW = NEE_RAW))) %>%
+  ungroup() %>%
+  mutate(equation = sprintf('NEE = %.2f + %.2f x\nR² = %.2f  RMSE = %.2f', intercept, slope, r2, rmse))
+
+plot_data_base <- left_join(plot_base_base, model_results_base, by = c('SITE','series'))
+
+p_base <- ggplot(plot_data_base, aes(x = Reco, y = NEE_RAW)) +
+  geom_point(color = 'black', alpha = 0.35) +
+  geom_smooth(aes(color = series), method = 'lm', se = FALSE) +
+  geom_abline(slope = 1, intercept = 0, linetype = 'dashed', color = 'grey40') +
+  facet_wrap(~ SITE, scales = 'free') +
+  geom_text(data = dplyr::filter(model_results_base, series == 'BASE_TRAMONTANA_RECO'),
+            aes(label = equation, color = series),
+            x = Inf, y = -Inf, hjust = 1.1, vjust = -0.6, size = 3.6, inherit.aes = FALSE) +
+  scale_color_manual(values = c('DT_RECO'='#2ca02c','NT_RECO'='#9467bd','BASE_TRAMONTANA_RECO'='#ff7f0e')) +
+  labs(title = NULL, x = 'Modeled Reco', y = 'Observed NEE (NEE_RAW)', color = 'Series') +
+  theme_classic() + theme(legend.position = 'bottom')
+
+#ggsave(
+#  filename = here::here("figures", "Nighttime_NEE_vs_Reco_bySite_BASE.png"),
+#  plot = p_base,
+#  width = 12,
+#  height = 7,
+#  dpi = 300,
+#  bg = "white"
+#)
+
+readr::write_csv(
+  model_results_base %>% arrange(SITE, desc(r2)),
+  here::here("output", "Nighttime_NEE_vs_Reco_stats_BASE.csv")
+)
+```
+
+```{r plot-night-combined, fig.width=12, fig.height=7}
+# --- Combined figure with 4 lines (BASE, BEST, DT, NT), cleaned site labels, centered last row ---
+
+# Palette and labels
+series_palette <- c('DT_RECO'='#2ca02c','NT_RECO'='#9467bd',
+                    'Tramontana_bestmodel_RECO'='#1f77b4','BASE_TRAMONTANA_RECO'='#ff7f0e')
+series_labels  <- c('BASE_TRAMONTANA_RECO'='Base',
+                    'Tramontana_bestmodel_RECO'='Best',
+                    'DT_RECO'='DT',
+                    'NT_RECO'='NT')
+
+# Bind long data
+combined_long <- bind_rows(dt_nt_long, best_tram, base_tram) %>%
+  filter(!is.na(Reco), !is.na(NEE_RAW)) %>%
+  mutate(series = factor(series, levels=c('BASE_TRAMONTANA_RECO','Tramontana_bestmodel_RECO','DT_RECO','NT_RECO')))
+
+# ---- Clean site labels (drop trailing _YYYY-YYYY or -YYYY-YYYY) for display only ----
+strip_years <- function(x) {
+  x <- gsub('(_|-)?[0-9]{4}-[0-9]{4}$', '', x)  # remove _YYYY-YYYY or -YYYY-YYYY at end
+  x <- gsub('(_|-)?[0-9]{4}$', '', x)           # fallback: remove a single year at end
+  x
+}
+combined_long <- combined_long %>% mutate(SITE_LABEL = strip_years(SITE))
+
+# ---- Center last row by padding with blank facet levels ----
+sites <- sort(unique(combined_long$SITE_LABEL))
+n <- length(sites)
+ncol <- if (n <= 3) n else 4  # choose up to 4 columns for balance
+if (ncol == 0) ncol <- 1
+rem <- n %% ncol
+pad <- if (rem == 0) 0 else (ncol - rem)
+left_pad <- floor(pad/2); right_pad <- ceiling(pad/2)
+pad_levels <- if (pad > 0) paste0("pad", seq_len(pad)) else character(0)
+levels_all <- c(pad_levels[seq_len(left_pad)], sites, if (pad > 0) pad_levels[(left_pad+1):pad] else character(0))
+combined_long <- combined_long %>% mutate(SITE_LABEL_F = factor(SITE_LABEL, levels = levels_all))
+
+# Labeller to hide pad facet strips
+lab_map <- setNames(c(rep("", pad), sites), levels_all)
+
+p_combined <- ggplot(combined_long, aes(x = Reco, y = NEE_RAW)) +
+  geom_point(color = 'black', alpha = 0.25) +
+  geom_smooth(aes(color = series), method = 'lm', se = FALSE) +
+  geom_abline(slope = 1, intercept = 0, linetype = 'dashed', color = 'grey40') +
+  facet_wrap(~ SITE_LABEL_F, ncol = ncol, scales = 'free', drop = FALSE,
+             labeller = labeller(SITE_LABEL_F = lab_map)) +
+  scale_color_manual(values = series_palette, drop = FALSE,
+                     name = 'Series', labels = series_labels) +
+  labs(title = NULL, x = 'Modeled Reco', y = 'Observed NEE') +
+  theme_classic() + theme(legend.position = 'bottom')
+
+#ggsave('Nighttime_NEE_vs_Reco_bySite_COMBINED.png', plot = p_combined, width = 12, height = 7, dpi = 300, bg = 'white')
+
+# Stats table (no on-figure text)
+combined_stats <- combined_long %>%
+  filter(!grepl('^pad', SITE_LABEL_F)) %>%
+  group_by(SITE = SITE_LABEL, series) %>%
+  group_modify(~fit_stats(.x)) %>%
+  ungroup() %>%
+  arrange(SITE, factor(series, levels=c('BASE_TRAMONTANA_RECO','Tramontana_bestmodel_RECO','DT_RECO','NT_RECO'))) %>%
+  mutate(series = recode(as.character(series),
+                         'BASE_TRAMONTANA_RECO'='Base',
+                         'Tramontana_bestmodel_RECO'='Best',
+                         'DT_RECO'='DT',
+                         'NT_RECO'='NT'))
+
+#readr::write_csv(combined_stats, 'Nighttime_NEE_vs_Reco_stats_COMBINED.csv')
+
+# Display in the document
+combined_stats_fmt <- combined_stats %>%
+  mutate(across(c(intercept, slope, r2, rmse), ~round(.x, 3)))
+knitr::kable(combined_stats_fmt, align = 'l')
+```
+
+```{r output summary stats for paper}
+
+# Compare across methods
+combined_stats_all_methods_wide <- combined_stats_fmt %>%
+  mutate(series = toupper(series)) %>%   # ensure BASE/BEST/DT/NT
+  pivot_wider(
+    id_cols = SITE,
+    names_from = series,
+    values_from = c(intercept, slope, r2, rmse, n),
+    names_glue = "{.value}_{series}"
+  ) %>%
+  select(
+    SITE,
+    # slopes
+    slope_BEST, slope_NT, slope_DT, 
+    # r2
+    r2_BEST, r2_NT, r2_DT, 
+    # rmse
+    rmse_BEST, rmse_NT, rmse_DT, 
+  )
+
+readr::write_csv(
+  combined_stats_all_methods_wide,
+  here::here("output", "Tramontana_Model_Stats_Wide.csv")
+)
+
+combined_stats_ANN_wide <- combined_stats_fmt %>%
+  mutate(series = toupper(series)) %>%   # ensure BASE/BEST/DT/NT
+  pivot_wider(
+    id_cols = SITE,
+    names_from = series,
+    values_from = c(intercept, slope, r2, rmse, n),
+    names_glue = "{.value}_{series}"
+  ) %>%
+  select(
+    SITE,
+    # slopes
+    slope_BEST, slope_BASE, 
+    # r2
+    r2_BEST, r2_BASE, 
+    # rmse
+    rmse_BEST, rmse_BASE,
+  )
+
+readr::write_csv(
+  combined_stats_ANN_wide,
+  here::here("output", "ANN_only_Model_Stats_Wide.csv")
+)
+```
+
+```{r generate dataframes for subsequent use}
+
+# -----------------------------
+# 1) Ensure TIMESTAMP is POSIXct
+# -----------------------------
+if (!inherits(df_subset$TIMESTAMP, "POSIXct")) {
+  df_subset <- df_subset %>%
+    mutate(
+      TIMESTAMP = parse_date_time(
+        as.character(TIMESTAMP),
+        orders = c("Ymd HM", "Ymd HMS", "Y-m-d H:M:S", "Y-m-d H:M")
+      )
+    )
+}
+
+# -----------------------------
+# 2) Nighttime subset and long table for NEE_RAW vs modeled RECO
+#    (used for "Nighttime NEE vs Reco" scatter plots)
+# -----------------------------
+df_night_pdf <- df_subset %>%
+  filter(is.finite(SW_IN_RAW), SW_IN_RAW < 10) %>%
+  drop_na(NEE_RAW)
+
+present_dtnt <- intersect(c("DT_RECO", "NT_RECO"), names(df_subset))
+
+dt_nt_long_pdf <- if (length(present_dtnt) > 0) {
+  df_night_pdf %>%
+    arrange(SITE, TIMESTAMP) %>%
+    group_by(SITE, TIMESTAMP) %>% slice(1) %>% ungroup() %>%      # de-dup
+    select(SITE, TIMESTAMP, NEE_RAW, all_of(present_dtnt)) %>%
+    pivot_longer(all_of(present_dtnt), names_to = "series", values_to = "Reco")
+} else {
+  tibble(
+    SITE = character(),
+    TIMESTAMP = as.POSIXct(character()),
+    NEE_RAW = double(),
+    series = character(),
+    Reco = double()
+  )
+}
+
+best_tram_pdf <- if ("bestmodel_RECO" %in% names(df_night_pdf)) {
+  df_night_pdf %>%
+    transmute(
+      SITE, TIMESTAMP, NEE_RAW,
+      series = "Tramontana_bestmodel_RECO",
+      Reco   = bestmodel_RECO
+    )
+} else {
+  tibble(
+    SITE = character(),
+    TIMESTAMP = as.POSIXct(character()),
+    NEE_RAW = double(),
+    series = character(),
+    Reco = double()
+  )
+}
+
+plot_base_night <- bind_rows(dt_nt_long_pdf, best_tram_pdf) %>%
+  mutate(series = factor(series, levels = c("DT_RECO", "NT_RECO", "Tramontana_bestmodel_RECO"))) %>%
+  drop_na(Reco, NEE_RAW)
+
+# -----------------------------
+# 3) Add season + time-of-day; create diurnal base + diurnal_stats
+#    (used for diurnal mean ± SD line/ribbon plots)
+# -----------------------------
+df_ss <- df_subset %>%
+  mutate(
+    month  = month(TIMESTAMP),
+    season = case_when(
+      month %in% c(12, 1, 2) ~ "Winter",
+      month %in% 3:5         ~ "Spring",
+      month %in% 6:8         ~ "Summer",
+      month %in% 9:11        ~ "Fall",
+      TRUE                   ~ "Unknown"
+    ),
+    tod = hour(TIMESTAMP) + minute(TIMESTAMP) / 60
+  )
+
+cand_cols <- c("DT_RECO", "NT_RECO", "DT_GPP", "NT_GPP")
+present_cols <- intersect(cand_cols, names(df_ss))
+
+dtnt_diurnal <- if (length(present_cols) > 0) {
+  df_ss %>%
+    arrange(SITE, TIMESTAMP) %>%
+    group_by(SITE, TIMESTAMP, season, tod) %>% slice(1) %>% ungroup() %>%   # de-dup
+    select(SITE, season, tod, all_of(present_cols)) %>%
+    pivot_longer(cols = all_of(present_cols), names_to = "series", values_to = "flux_value") %>%
+    mutate(
+      flux_class = if_else(grepl("GPP$", series), "GPP", "RECO"),
+      flux_value = if_else(flux_class == "GPP", -flux_value, flux_value)    # plot GPP as positive uptake
+    )
+} else {
+  tibble(
+    SITE = character(),
+    season = character(),
+    tod = double(),
+    series = character(),
+    flux_value = double(),
+    flux_class = character()
+  )
+}
+
+best_tram_d <- if ("bestmodel_RECO" %in% names(df_ss)) {
+  df_ss %>%
+    transmute(
+      SITE, season, tod,
+      series = "Tramontana_bestmodel_RECO",
+      flux_value = bestmodel_RECO,
+      flux_class = "RECO"
+    )
+} else tibble(SITE=character(), season=character(), tod=double(), series=character(), flux_value=double(), flux_class=character())
+
+best_tram_g <- if ("bestmodel_GPP" %in% names(df_ss)) {
+  df_ss %>%
+    transmute(
+      SITE, season, tod,
+      series = "Tramontana_bestmodel_GPP",
+      flux_value = -bestmodel_GPP,
+      flux_class = "GPP"
+    )
+} else tibble(SITE=character(), season=character(), tod=double(), series=character(), flux_value=double(), flux_class=character())
+
+diurnal_base <- bind_rows(dtnt_diurnal, best_tram_d, best_tram_g) %>%
+  filter(is.finite(tod), !is.na(flux_value)) %>%
+  mutate(
+    series = factor(
+      series,
+      levels = c(
+        "Tramontana_bestmodel_GPP", "Tramontana_bestmodel_RECO",
+        "DT_RECO", "NT_RECO", "NT_GPP", "DT_GPP"
+      )
+    )
+  )
+
+diurnal_stats <- if (nrow(diurnal_base) > 0) {
+  diurnal_base %>%
+    group_by(SITE, season, tod, flux_class, series) %>%
+    summarise(
+      mean_flux = mean(flux_value, na.rm = TRUE),
+      sd_flux   = sd(flux_value, na.rm = TRUE),
+      n_obs     = sum(is.finite(flux_value)),
+      .groups   = "drop"
+    )
+} else {
+  tibble(
+    SITE = character(),
+    season = character(),
+    tod = double(),
+    flux_class = character(),
+    series = factor(character()),
+    mean_flux = double(),
+    sd_flux = double(),
+    n_obs = integer()
+  )
+}
+
+# -----------------------------
+# 4) Time-series long table + gap-based segment IDs
+#    (used for time-series line plots with breaks across gaps)
+# -----------------------------
+ts_reco <- df_subset %>%
+  select(SITE, TIMESTAMP, any_of(c("DT_RECO", "NT_RECO", "bestmodel_RECO"))) %>%
+  pivot_longer(cols = -c(SITE, TIMESTAMP), names_to = "series", values_to = "value") %>%
+  mutate(flux_class = "RECO")
+
+ts_gpp <- df_subset %>%
+  select(SITE, TIMESTAMP, any_of(c("DT_GPP", "NT_GPP", "bestmodel_GPP"))) %>%
+  pivot_longer(cols = -c(SITE, TIMESTAMP), names_to = "series", values_to = "value") %>%
+  mutate(flux_class = "GPP")
+
+ts_long <- bind_rows(ts_reco, ts_gpp) %>%
+  mutate(
+    series = recode(
+      series,
+      "DT_RECO"        = "DT_RECO",
+      "NT_RECO"        = "NT_RECO",
+      "bestmodel_RECO" = "Tramontana_bestmodel_RECO",
+      "DT_GPP"         = "DT_GPP",
+      "NT_GPP"         = "NT_GPP",
+      "bestmodel_GPP"  = "Tramontana_bestmodel_GPP"
+    ),
+    series = factor(
+      series,
+      levels = c(
+        "Tramontana_bestmodel_GPP", "DT_GPP", "NT_GPP",
+        "Tramontana_bestmodel_RECO", "DT_RECO", "NT_RECO"
+      )
+    )
+  ) %>%
+  arrange(SITE, series, TIMESTAMP) %>%
+  group_by(SITE, series, flux_class) %>%
+  mutate(
+    dt_hours = as.numeric(difftime(TIMESTAMP, lag(TIMESTAMP), units = "hours")),
+    ref_dt   = median(dt_hours, na.rm = TRUE),
+    gap_flag = if_else(is.na(dt_hours) | dt_hours <= 1.5 * ref_dt, 0L, 1L),
+    seg_id   = cumsum(coalesce(gap_flag, 0L))
+  ) %>%
+  ungroup() %>%
+  drop_na(value)
+```
+
+```{r diurnal-spring-summer-all-sites, message=FALSE, warning=FALSE}
+
+# UPDATED: Two PNGs — GPP and RECO for ALL sites (Spring + Summer), comparing BEST vs NT & DT
+# Includes vertical dashed lines at 06:00 and 18:00.
+# Not saved
+
+if (!exists("strip_years")) {
+  strip_years <- function(x) gsub("\\b(19|20)\\d{2}\\b", "", x)
+}
+if (exists("diurnal_stats") && nrow(diurnal_stats) > 0) {
+  
+  make_plot <- function(flux_target, outfile, series_keep) {
+    d <- diurnal_stats %>%
+      dplyr::filter(season %in% c('Spring','Summer'),
+                    flux_class == flux_target,
+                    series %in% series_keep) %>%
+      dplyr::mutate(SITE_LABEL = strip_years(SITE)) %>%
+      dplyr::group_by(SITE_LABEL, season, series, tod) %>%
+      dplyr::summarise(mean_flux = mean(mean_flux, na.rm = TRUE),
+                       sd_flux   = sqrt(mean(sd_flux^2, na.rm = TRUE)),
+                       .groups = 'drop') %>%
+      dplyr::mutate(series = factor(series, levels = series_keep))
+    
+    if (nrow(d) == 0) return(invisible(NULL))
+    n_sites <- length(unique(d$SITE_LABEL))
+    
+    pal <- c('Tramontana_bestmodel_GPP'='#1f77b4',
+             'NT_GPP'='#9467bd',
+             'Tramontana_bestmodel_RECO'='#1f77b4',
+             'NT_RECO'='#9467bd')
+    
+    if (exists('series_colors_diurnal')) {
+      keep_names <- intersect(names(series_colors_diurnal), levels(d$series))
+      if (length(keep_names) == length(levels(d$series))) {
+        pal <- series_colors_diurnal[keep_names]
+      } else {
+        pal <- pal[levels(d$series)]
+      }
+    } else {
+      pal <- pal[levels(d$series)]
+    }
+    
+    p <- ggplot(d, aes(x = tod, y = mean_flux, color = series, fill = series)) +
+      geom_line(linewidth = 0.6, alpha = 0.95, na.rm = TRUE) +
+      geom_ribbon(aes(ymin = mean_flux - sd_flux, ymax = mean_flux + sd_flux),
+                  alpha = 0.20, color = NA) +
+      geom_vline(xintercept = c(6, 18), linetype = 'dashed', linewidth = 0.4, alpha = 0.6) +
+      facet_grid(rows = vars(SITE_LABEL), cols = vars(season), scales = 'free_y') +
+      scale_x_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
+      scale_color_manual(values = pal, drop = FALSE) +
+      scale_fill_manual(values = pal, drop = FALSE) +
+      labs(title = paste0('Diurnal ', flux_target, ' — Spring and Summer (BEST vs NT)'),
+           x = 'Hour of day', y = 'Mean ± SD', color = 'Series', fill = 'Series') +
+      theme_minimal() +
+      theme(legend.position = 'bottom',
+            panel.grid.minor = element_blank(),
+            strip.text = element_text(size = 8))
+    
+    # Save into figures directory one level up
+    ggsave(
+      filename = here::here("figures", outfile),
+      plot = p,
+      width = 10,
+      height = max(8, n_sites * 1.6),
+      dpi = 300,
+      bg = "white"
+    )
+  }
+  
+  # Save two separate PNGs into figures/
+  #  make_plot('GPP',  'Diurnal_GPP_AllSites_Spring_Summer.png',
+  #            c('Tramontana_bestmodel_GPP','NT_GPP','DT_GPP'))
+  
+  #  make_plot('RECO', 'Diurnal_RECO_AllSites_Spring_Summer.png',
+  #            c('Tramontana_bestmodel_RECO','NT_RECO','DT_RECO'))
+}
+```
+
+```{r export-csv}
+# --- Exports ---
+
+# Main subset export
+readr::write_csv(
+  df_subset,
+  here::here("output", "Tramontana_All_Sites_Best.csv"),
+  na = "-9999"
+)
+
+# Nighttime model stats and best-model summary
+readr::write_csv(
+  model_results,
+  here::here("output", "All_Model_Run_Stats.csv")
+)
+
+readr::write_csv(
+  best_models,
+  here::here("output","Best_Model_Runs_By_SiteMethod.csv")
+)
+
+# NEW: Per-site NEE statistics (mean and SD)
+if (all(c("SITE", "NEE_RAW") %in% names(df_subset))) {
+  
+  nee_site_stats <- df_subset %>%
+    dplyr::group_by(SITE) %>%
+    dplyr::summarise(
+      mean_NEE = mean(NEE_RAW, na.rm = TRUE),
+      sd_NEE   = stats::sd(NEE_RAW, na.rm = TRUE),
+      n_NEE    = sum(!is.na(NEE_RAW)),
+      .groups  = "drop"
+    )
+  
+  readr::write_csv(
+    nee_site_stats,
+    here::here("output", "Site_NEE_mean_sd.csv")
+  )
+}
+```
+
+## time series of WTD, Salinity, TA & NEE by site
+
+```{r timeseries-wtd-sal-ta-nee-bySite, message=FALSE, warning=FALSE}
+# Time series PNGs for WTD, Salinity, TA & NEE, faceted by site
+# Layout is similar to Nighttime_NEE_vs_Reco_bySite_COMBINED.png
+
+# Rename sites
+df_subset_orig <- df_subset # Keep original data frame for below when plotting isotopes
+
+df_subset <- df_subset %>%
+  dplyr::mutate(
+    SITE = gsub("_.*", "", SITE),                     # remove _dates
+    SITE = paste0(
+      substr(SITE, 1, 2), "-",                        # first 2 letters
+      substr(SITE, nchar(SITE) - 2, nchar(SITE))      # last 3 letters
+    )
+  )
+
+df_subset <- df_subset %>%
+  dplyr::select(-dplyr::any_of("Site_ID"))
+
+# Replace SITE in plot_base_best with the exact Site_ID strings
+df_subset <- df_subset %>%
+  mutate(SITE_UPPER = toupper(SITE)) %>%           # key in same format
+  left_join(site_id_lookup, by = "SITE_UPPER") %>% # bring in Site_ID
+  mutate(SITE = Site_ID) %>%                       # overwrite SITE
+  select(-SITE_UPPER, -Site_ID)                    # drop helper cols
+
+if (!inherits(df_subset$TIMESTAMP, "POSIXct")) {
+  df_subset <- df_subset %>%
+    dplyr::mutate(
+      TIMESTAMP = lubridate::as_datetime(TIMESTAMP, tz = "UTC")
+    )
+}
+
+make_ts_plot <- function(value_col, outfile, ylab) {
+  if (!value_col %in% names(df_subset)) return(invisible(NULL))
+  
+  d <- df_subset %>%
+    dplyr::filter(!is.na(TIMESTAMP)) %>%
+    dplyr::select(SITE, TIMESTAMP, value = dplyr::all_of(value_col)) %>%
+    dplyr::mutate(SITE_LABEL = strip_years(SITE))
+  
+  if (nrow(d) == 0) return(invisible(NULL))
+  
+  # --- Facet layout like COMBINED plot ---
+  sites <- sort(unique(d$SITE_LABEL))
+  n     <- length(sites)
+  ncol  <- if (n <= 3) n else 4
+  if (ncol == 0) ncol <- 1
+  rem       <- n %% ncol
+  pad       <- if (rem == 0) 0 else (ncol - rem)
+  left_pad  <- floor(pad / 2)
+  right_pad <- ceiling(pad / 2)
+  pad_levels <- if (pad > 0) paste0("pad", seq_len(pad)) else character(0)
+  
+  levels_all <- c(
+    pad_levels[seq_len(left_pad)],
+    sites,
+    if (pad > 0) pad_levels[(left_pad + 1):pad] else character(0)
+  )
+  
+  d <- d %>%
+    dplyr::mutate(SITE_LABEL_F = factor(SITE_LABEL, levels = levels_all)) %>%
+    dplyr::arrange(SITE_LABEL_F, TIMESTAMP) %>%
+    dplyr::group_by(SITE_LABEL_F) %>%
+    dplyr::mutate(
+      dt_hours  = as.numeric(difftime(TIMESTAMP, dplyr::lag(TIMESTAMP), units = "hours")),
+      ref_dt    = median(dt_hours, na.rm = TRUE),
+      gap_flag  = dplyr::if_else(is.na(dt_hours) | dt_hours <= 1.5 * ref_dt, 0L, 1L),
+      seg_id    = cumsum(dplyr::coalesce(gap_flag, 0L))
+    ) %>%
+    dplyr::ungroup()
+  
+  lab_map <- stats::setNames(
+    as.list(ifelse(grepl("^pad", levels_all), "", levels_all)),
+    levels_all
+  )
+  
+  p <- ggplot(d, aes(x = TIMESTAMP, y = value, group = seg_id)) +
+    geom_line(alpha = 0.8, linewidth = 0.4) +
+    facet_wrap(
+      ~ SITE_LABEL_F,
+      ncol   = ncol,
+      scales = "free_x",
+      drop   = FALSE,
+      labeller = labeller(SITE_LABEL_F = lab_map)
+    ) +
+    labs(
+      title = paste0("Time series of ", ylab, " by site"),
+      x = "Time",
+      y = ylab
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.minor = element_blank(),
+      strip.text       = element_text(size = 8)
+    )
+  
+  ggsave(
+    filename = here::here("figures", outfile),
+    plot = p,
+    width = 12,
+    height = 7,
+    dpi = 300,
+    bg = "white"
+  )
+  
+}
+
+# Map friendly names to column names
+ts_specs <- list(
+  WTD      = list(col = "WTD",      ylab = "Water table depth"),
+  Salinity = list(col = "Salinity", ylab = "Salinity"),
+  TA       = list(col = "TA",       ylab = "TA"),
+  NEE      = list(col = "NEE_RAW",  ylab = "NEE (NEE_RAW)")
+)
+
+for (nm in names(ts_specs)) {
+  spec <- ts_specs[[nm]]
+  if (spec$col %in% names(df_subset)) {
+    outfile <- paste0("Timeseries_", nm, "_bySite.png")
+    make_ts_plot(spec$col, outfile, spec$ylab)
+  }
+}
+
+# NEE Plots
+# -----------------------------
+# 2) Violin plot + mean, median, IQR
+# -----------------------------
+pNEE <- ggplot(df_subset, aes(x = SITE, y = NEE_RAW)) +
+  
+  # Distribution
+  geom_violin(
+    aes(fill = SITE),
+    trim = TRUE,
+    scale = "width",
+    alpha = 0.75,
+    color = "grey25"
+  ) +
+  
+  # IQR (25th–75th percentile)
+  stat_summary(
+    fun.data = function(x) {
+      data.frame(
+        y    = median(x, na.rm = TRUE),
+        ymin = quantile(x, 0.25, na.rm = TRUE),
+        ymax = quantile(x, 0.75, na.rm = TRUE)
+      )
+    },
+    geom = "linerange",
+    linewidth = 1.1,
+    color = "black"
+  ) +
+  
+  # Median (horizontal line)
+  stat_summary(
+    fun = median,
+    geom = "point",
+    shape = 24, 
+    color = "red",
+    fill = "red"
+  ) +
+  
+  # Mean (point)
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 24, 
+    color = "white",
+    fill = "white"
+  ) +
+  
+  theme_bw(base_size = 11) +
+  labs(
+    x = '',
+    y = expression(NEE~(mu*mol~m^{-2}~s^{-1}))
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+
+ggsave(
+  filename = here::here("figures", "NEE_violin_by_site.png"),
+  plot     = pNEE,
+  width    = 8,
+  height   = 5,
+  units    = "in",
+  dpi      = 300
+)
+```
+
+```{r summarize site characteristics}
+
+# Recalculate site-level median and IQR using years with > 40% of the data for each variable
+
+# Variables of interest
+vars <- c("NEE_RAW", "WTD", "Salinity", "TA")
+
+# Calculate yearly data availability
+yearly_coverage <- df_subset %>%
+  filter(!is.na(Year)) %>%
+  group_by(SITE, Year) %>%
+  summarise(
+    n_total = n(),
+    across(
+      all_of(vars),
+      ~ sum(!is.na(.x)) / n_total,
+      .names = "frac_{.col}"
+    ),
+    .groups = "drop"
+  )
+
+valid_years <- yearly_coverage %>%
+  filter(
+    frac_NEE_RAW > 0.4,
+    frac_WTD     > 0.4,
+    frac_Salinity > 0.4,
+    frac_TA      > 0.4
+  ) %>%
+  select(SITE, Year)
+
+site_summary_variables <- df_subset %>%
+  semi_join(valid_years, by = c("SITE", "Year")) %>%
+  group_by(SITE) %>%
+  summarise(
+    across(
+      all_of(vars),
+      list(
+        median = ~ median(.x, na.rm = TRUE),
+        iqr = ~ IQR(.x, na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+# Now calculate inundation fraction:
+
+wtd_positive_fraction <- df_subset %>%
+  semi_join(valid_years, by = c("SITE", "Year")) %>%
+  group_by(SITE) %>%
+  summarise(
+    pct_flooding = mean(WTD >= 0, na.rm = TRUE) * 100,
+    n_obs_WTD        = sum(!is.na(WTD)),
+    n_years          = n_distinct(Year),
+    .groups = "drop"
+  )
+
+site_summary_variables <- site_summary_variables %>%
+  left_join(
+    wtd_positive_fraction,
+    by = "SITE"
+  )
+
+site_summary_variables
+
+readr::write_csv(
+  site_summary_variables,
+  here::here("output", "site_characteristics_summary_variables.csv")
+)
+
+# Recalculate site-level mean and SD using all data
+
+# Variables of interest
+vars <- c("NEE_RAW")
+
+site_summary_variables_mean <- df_subset %>%
+  group_by(SITE) %>%
+  summarise(
+    across(
+      all_of(vars),
+      list(
+        mean = ~ mean(.x, na.rm = TRUE),
+        iqr    = ~ IQR(.x, na.rm = TRUE),
+        n      = ~ sum(is.finite(.x))
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+```
+
+## diurnal plots split into Spring/Summer × GPP/RECO (4 PNGs)
+
+```{r diurnal-spring-summer-all-sites-4png, message=FALSE, warning=FALSE}
+# Four PNGs: Spring GPP, Spring RECO, Summer GPP, Summer RECO
+# All sites, BEST vs NT, faceted by site in a grid
+
+# Rename sites
+diurnal_stats <- diurnal_stats %>%
+  dplyr::mutate(
+    SITE = gsub("_.*", "", SITE),                     # remove _dates
+    SITE = paste0(
+      substr(SITE, 1, 2), "-",                        # first 2 letters
+      substr(SITE, nchar(SITE) - 2, nchar(SITE))      # last 3 letters
+    )
+  )
+
+# Replace SITE in plot_base_best with the exact Site_ID strings
+diurnal_stats <- diurnal_stats %>%
+  mutate(SITE_UPPER = toupper(SITE)) %>%           # key in same format
+  left_join(site_id_lookup, by = "SITE_UPPER") %>% # bring in Site_ID
+  mutate(SITE = Site_ID) %>%                       # overwrite SITE
+  select(-SITE_UPPER, -Site_ID)                    # drop helper cols
+
+diurnal_stats <- diurnal_stats %>%
+  dplyr::mutate(SITE_LABEL = SITE)
+
+if (exists("diurnal_stats") && nrow(diurnal_stats) > 0) {
+  
+  make_diurnal_plot <- function(flux_target, season_target, outfile, series_keep) {
+    
+    d <- diurnal_stats %>%
+      dplyr::filter(
+        season == season_target,
+        flux_class == flux_target,
+        series %in% series_keep
+      ) %>%
+      dplyr::group_by(SITE_LABEL, series, tod) %>%
+      dplyr::summarise(
+        mean_flux = mean(mean_flux, na.rm = TRUE),
+        sd_flux   = sqrt(mean(sd_flux^2, na.rm = TRUE)),
+        .groups   = "drop"
+      ) %>%
+      dplyr::mutate(series = factor(series, levels = series_keep))
+    
+    if (nrow(d) == 0) return(invisible(NULL))
+    
+    # Facet layout similar to COMBINED plot
+    sites <- sort(unique(d$SITE_LABEL))
+    n <- length(sites)
+    ncol <- if (n <= 3) n else 4
+    if (ncol == 0) ncol <- 1
+    rem <- n %% ncol
+    pad <- if (rem == 0) 0 else (ncol - rem)
+    left_pad  <- floor(pad / 2)
+    right_pad <- ceiling(pad / 2)
+    pad_levels <- if (pad > 0) paste0("pad", seq_len(pad)) else character(0)
+    
+    levels_all <- c(
+      pad_levels[seq_len(left_pad)],
+      sites,
+      if (pad > 0) pad_levels[(left_pad + 1):pad] else character(0)
+    )
+    
+    d <- d %>%
+      dplyr::mutate(SITE_LABEL_F = factor(SITE_LABEL, levels = levels_all))
+    
+    lab_map <- stats::setNames(
+      as.list(ifelse(grepl("^pad", levels_all), "", levels_all)),
+      levels_all
+    )
+    
+    # Palette: fall back to series_colors_diurnal if available
+    pal <- c(
+      "Tramontana_bestmodel_GPP"  = "#1f77b4",
+      "NT_GPP"                    = "#9467bd",
+      "DT_GPP"                    = "#2ca02c",
+      "Tramontana_bestmodel_RECO" = "#1f77b4",
+      "NT_RECO"                   = "#9467bd",
+      "DT_RECO"                   = "#2ca02c"
+    )
+    
+    if (exists("series_colors_diurnal")) {
+      keep_names <- intersect(names(series_colors_diurnal), levels(d$series))
+      if (length(keep_names) == length(levels(d$series))) {
+        pal <- series_colors_diurnal[keep_names]
+      } else {
+        pal <- pal[levels(d$series)]
+      }
+    } else {
+      pal <- pal[levels(d$series)]
+    }
+    
+    # Legend labels depend on flux_target
+    legend_labels <- if (flux_target == "GPP") {
+      c(
+        "Tramontana_bestmodel_GPP" = expression(ANN[BEST]),
+        "NT_GPP"                   = "Nighttime",
+        "DT_GPP"                   = "Daytime"
+      )
+    } else {
+      c(
+        "Tramontana_bestmodel_RECO" = expression(ANN[BEST]),
+        "NT_RECO"                   = "Nighttime",
+        "DT_RECO"                   = "Daytime"
+      )
+    }
+    
+    # y-axis label depends on flux_target
+    y_lab <- if (flux_target == "GPP") {
+      expression(GPP~(mu*mol~m^{-2}~s^{-1}))
+    } else {
+      expression(RECO~(mu*mol~m^{-2}~s^{-1}))
+    }
+    
+    p <- ggplot(d, aes(x = tod, y = mean_flux, color = series, fill = series)) +
+      geom_line(linewidth = 0.6, alpha = 0.95, na.rm = TRUE) +
+      geom_ribbon(
+        aes(ymin = mean_flux - sd_flux, ymax = mean_flux + sd_flux),
+        alpha = 0.20, color = NA
+      ) +
+      geom_vline(
+        xintercept = c(6, 18),
+        linetype = "dashed", linewidth = 0.4, alpha = 0.6
+      ) +
+      facet_wrap(
+        ~ SITE_LABEL_F,
+        ncol = ncol,
+        scales = "free_y",
+        drop = FALSE,
+        labeller = labeller(SITE_LABEL_F = lab_map)
+      ) +
+      scale_x_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
+      
+      # --- legend colors + new labels ---
+      scale_color_manual(
+        values = pal,
+        labels = legend_labels[levels(d$series)],
+        drop   = FALSE
+      ) +
+      scale_fill_manual(
+        values = pal,
+        labels = legend_labels[levels(d$series)],
+        drop   = FALSE
+      ) +
+      
+      labs(
+        title = NULL,
+        x = "Hour of day",
+        y = y_lab,
+        color = NULL,   # remove legend title
+        fill  = NULL    # remove legend title
+      ) +
+      
+      theme_minimal() +
+      theme(
+        legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(size = 8)
+      )
+    
+    ggsave(
+      filename = here::here("figures", outfile),
+      plot = p,
+      width = 12,
+      height = 7,
+      dpi = 300,
+      bg = "white"
+    )
+  }
+  
+  # 4 PNGs: Spring/Summer × GPP/RECO
+  make_diurnal_plot("GPP",  "Spring",
+                    "Diurnal_GPP_AllSites_Spring.png",
+                    c("Tramontana_bestmodel_GPP", "NT_GPP", "DT_GPP"))
+  
+  make_diurnal_plot("RECO", "Spring",
+                    "Diurnal_RECO_AllSites_Spring.png",
+                    c("Tramontana_bestmodel_RECO", "NT_RECO", "DT_RECO"))
+  
+  make_diurnal_plot("GPP",  "Summer",
+                    "Diurnal_GPP_AllSites_Summer.png",
+                    c("Tramontana_bestmodel_GPP", "NT_GPP", "DT_GPP"))
+  
+  make_diurnal_plot("RECO", "Summer",
+                    "Diurnal_RECO_AllSites_Summer.png",
+                    c("Tramontana_bestmodel_RECO", "NT_RECO", "DT_RECO"))
+}
+```
+
+## diurnal plots split into Spring/Summer × GPP/RECO & flooded vs. non-flooded
+
+```{r diurnal-spring-summer-flooded non flooded-all-sites-4png, message=FALSE, warning=FALSE}
+# -----------------------------
+# 1) Prep: add season + tod + flood_state
+# -----------------------------
+df_ss <- df_subset %>%
+  mutate(
+    month = month(TIMESTAMP),
+    season = case_when(
+      month %in% c(12, 1, 2) ~ "Winter",
+      month %in% 3:5         ~ "Spring",
+      month %in% 6:8         ~ "Summer",
+      month %in% 9:11        ~ "Fall",
+      TRUE                   ~ NA_character_
+    ),
+    tod = hour(TIMESTAMP) + minute(TIMESTAMP)/60,
+    flood_state = case_when(
+      is.na(WTD) ~ NA_character_,
+      WTD > 0    ~ "Flooded",
+      TRUE       ~ "Not flooded"
+    )
+  ) %>%
+  filter(season == "Summer")
+
+# -----------------------------
+# 2) Long table (DT/NT + Tramontana best if present)
+# -----------------------------
+present_reco <- intersect(c("DT_RECO", "NT_RECO"), names(df_ss))
+present_gpp  <- intersect(c("DT_GPP",  "NT_GPP"),  names(df_ss))
+
+has_best_reco <- "bestmodel_RECO" %in% names(df_ss)
+has_best_gpp  <- "bestmodel_GPP"  %in% names(df_ss)
+
+reco_long <- df_ss %>%
+  select(SITE, tod, flood_state, all_of(present_reco)) %>%
+  pivot_longer(cols = all_of(present_reco), names_to = "series", values_to = "flux_value") %>%
+  mutate(flux_class = "RECO")
+
+gpp_long <- df_ss %>%
+  select(SITE, tod, flood_state, all_of(present_gpp)) %>%
+  pivot_longer(cols = all_of(present_gpp), names_to = "series", values_to = "flux_value") %>%
+  mutate(flux_class = "GPP", flux_value = -flux_value)  # plot GPP as positive uptake
+
+best_reco_long <- if (has_best_reco) {
+  df_ss %>%
+    transmute(
+      SITE, tod, flood_state,
+      series = "Tramontana_bestmodel_RECO",
+      flux_value = bestmodel_RECO,
+      flux_class = "RECO"
+    )
+} else tibble()
+
+best_gpp_long <- if (has_best_gpp) {
+  df_ss %>%
+    transmute(
+      SITE, tod, flood_state,
+      series = "Tramontana_bestmodel_GPP",
+      flux_value = -bestmodel_GPP,
+      flux_class = "GPP"
+    )
+} else tibble()
+
+diurnal_long <- bind_rows(reco_long, gpp_long, best_reco_long, best_gpp_long) %>%
+  filter(is.finite(tod), !is.na(flood_state), is.finite(flux_value)) %>%
+  mutate(
+    series = recode(
+      series,
+      "DT_RECO" = "Daytime",
+      "NT_RECO" = "Nighttime",
+      "DT_GPP"  = "Daytime",
+      "NT_GPP"  = "Nighttime",
+      "Tramontana_bestmodel_RECO" = "Tramontana best",
+      "Tramontana_bestmodel_GPP"  = "Tramontana best",
+    ),
+    series = factor(series, levels = c("Tramontana best", "Daytime", "Nighttime")),
+    flood_state = factor(
+      flood_state,
+      levels = c("Flooded", "Not flooded")  # flooded on top
+    ),
+    flux_class = factor(flux_class, levels = c("RECO", "GPP"))
+  )
+
+# -----------------------------
+# 3) Diurnal mean ± SD (Summer only)
+# -----------------------------
+diurnal_stats_flood <- diurnal_long %>%
+  group_by(SITE, flood_state, flux_class, series, tod) %>%
+  summarise(
+    mean_flux = mean(flux_value, na.rm = TRUE),
+    sd_flux   = sd(flux_value, na.rm = TRUE),
+    n_obs     = sum(is.finite(flux_value)),
+    .groups   = "drop"
+  )
+
+# -----------------------------
+# 4) Plot helper: one figure per flux class (Summer)
+# -----------------------------
+make_flux_flood_figure <- function(flux_target, outfile, y_lab_expr) {
+  
+  d0 <- diurnal_stats_flood %>%
+    filter(flux_class == flux_target) %>%
+    arrange(SITE, flood_state, series, tod)
+  
+  if (nrow(d0) == 0) return(invisible(NULL))
+  
+  # Break line segments at gaps in tod (e.g., missing bins)
+  d <- d0 %>%
+    group_by(SITE, flood_state, series) %>%
+    mutate(
+      dt = tod - lag(tod),
+      seg_id = cumsum(is.na(dt) | dt > 0.75)  # >0.75 h indicates a gap
+    ) %>%
+    ungroup()
+  
+  plot_one_state <- function(state_label, title_text) {
+    
+    dd <- d %>% filter(flood_state == state_label)
+    if (nrow(dd) == 0) return(NULL)
+    
+    ggplot(dd, aes(x = tod, y = mean_flux, color = series, fill = series)) +
+      geom_line(
+        aes(group = interaction(SITE, series, seg_id)),
+        linewidth = 0.7, alpha = 0.95, na.rm = TRUE
+      ) +
+      geom_ribbon(
+        aes(
+          ymin = mean_flux - sd_flux,
+          ymax = mean_flux + sd_flux,
+          group = interaction(SITE, series, seg_id)
+        ),
+        alpha = 0.20, color = NA
+      ) +
+      facet_wrap(~ SITE, nrow = 1, scales = "free_y") +
+      scale_x_continuous(breaks = seq(0, 24, by = 6), limits = c(0, 24)) +
+      labs(
+        title = title_text,
+        x = "",
+        y = y_lab_expr,
+        color = NULL,  # remove legend title
+        fill  = NULL
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(
+        legend.position  = "bottom",
+        panel.grid.minor = element_blank(),
+        strip.text       = element_text(size = 9)
+      )
+  }
+  
+  p_top <- plot_one_state("Flooded", "Flooded")
+  p_bot <- plot_one_state("Not flooded", "Not flooded")
+  
+  # Combine panels vertically using patchwork safely (no / operator)
+  plots <- Filter(Negate(is.null), list(p_top, p_bot))
+  if (length(plots) == 0) return(invisible(NULL))
+  
+  p <- patchwork::wrap_plots(plots, ncol = 1, guides = "collect") &
+    theme(legend.position = "bottom")
+  
+  ggsave(
+    filename = here::here("figures", outfile),
+    plot = p,
+    width = 14,
+    height = 7.5,
+    dpi = 300,
+    bg = "white"
+  )
+  
+  p
+}
+
+# Summer RECO
+p_reco_summer <- make_flux_flood_figure(
+  flux_target = "RECO",
+  outfile     = "Diurnal_RECO_Summer_Flooded_vs_NotFlooded_bySite.png",
+  y_lab_expr  = expression(RECO~(mu*mol~m^{-2}~s^{-1}))
+)
+
+# Summer GPP
+p_gpp_summer <- make_flux_flood_figure(
+  flux_target = "GPP",
+  outfile     = "Diurnal_GPP_Summer_Flooded_vs_NotFlooded_bySite.png",
+  y_lab_expr  = expression(GPP~(mu*mol~m^{-2}~s^{-1}))
+)
+```
+
+```{r model tramontana performance vs. site characteristics}
+
+# -----------------------------
+# 0) User inputs
+# -----------------------------
+best_reco_series <- c("Tramontana_bestmodel_RECO", "NT_RECO", "DT_RECO")
+
+# -----------------------------
+# 1) Load site info
+# -----------------------------
+df_site_info <- read_excel(here("data", "Site characteristics final.xlsx")) %>%
+  mutate(Site_ID = toupper(Site_ID))
+
+# -----------------------------
+# 2) Build predictors table ONCE (site-level covariates)
+#    (site_summary_variables already contains WTD_mean, Salinity_mean, etc.)
+# -----------------------------
+df_predictors <- site_summary_variables %>%
+  mutate(Site_ID = toupper(SITE)) %>%
+  select(-SITE)
+
+df_predictors <- df_site_info %>%
+  left_join(df_predictors, by = "Site_ID")
+
+# -----------------------------
+# 3) Build performance table in LONG form
+#    This prevents "same columns reused across series" issues
+# -----------------------------
+df_perf_long <- model_results_best %>%
+  filter(series %in% best_reco_series) %>%
+  mutate(Site_ID = toupper(SITE)) %>%
+  select(Site_ID, series, r2, rmse, slope) %>%
+  # Safety check: ensure Site_ID x series is unique
+  group_by(Site_ID, series) %>%
+  summarise(across(c(r2, rmse, slope), ~ dplyr::first(.x)), .groups = "drop") %>%
+  pivot_longer(
+    cols = c(r2, rmse, slope),
+    names_to = "response",
+    values_to = "value"
+  )
+
+# -----------------------------
+# 4) Final analysis table: predictors + (series, response, value)
+# -----------------------------
+df_all <- df_perf_long %>%
+  left_join(df_predictors, by = "Site_ID")
+
+# -----------------------------
+# 5) Specify metrics and predictors
+# -----------------------------
+responses  <- c("r2", "rmse", "slope")
+
+predictors <- c(
+  "Z_star","WTD_median", "WTD_iqr", "Salinity_median", "Salinity_iqr",
+  "TA_median", "TA_iqr", "NEE_RAW_median","NEE_RAW_iqr",
+  "pct_flooding","Tidal_range"
+)
+
+# -----------------------------
+# 6) Helper functions
+# -----------------------------
+theil_sen_fit <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]; y <- y[ok]
+  n <- length(x)
+  if (n < 3) return(list(slope = NA_real_, intercept = NA_real_, n = n))
+  
+  slopes <- c()
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      dx <- x[j] - x[i]
+      if (dx != 0) slopes <- c(slopes, (y[j] - y[i]) / dx)
+    }
+  }
+  slope <- median(slopes, na.rm = TRUE)
+  intercept <- median(y - slope * x, na.rm = TRUE)
+  
+  list(slope = slope, intercept = intercept, n = n)
+}
+
+perm_test <- function(x, y, stat_fun, B = 10000, seed = 1) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]; y <- y[ok]
+  n <- length(y)
+  if (n < 3) return(list(p_value = NA_real_, stat_obs = NA_real_, B = B, n = n))
+  
+  set.seed(seed)
+  stat_obs <- stat_fun(x, y)
+  stat_perm <- replicate(B, stat_fun(x, sample(y, size = n, replace = FALSE)))
+  
+  p <- (sum(abs(stat_perm) >= abs(stat_obs)) + 1) / (B + 1)
+  list(p_value = p, stat_obs = stat_obs, B = B, n = n)
+}
+
+kendall_tau <- function(x, y) {
+  suppressWarnings(cor(x, y, method = "kendall", use = "complete.obs"))
+}
+
+# -----------------------------
+# 7) Run analyses (by series, response, predictor)
+# -----------------------------
+results <- tidyr::crossing(
+  series    = unique(df_all$series),
+  resp_name = responses,
+  predictor = predictors
+) %>%
+  purrr::pmap_dfr(function(series, resp_name, predictor) {
+    
+    dat <- df_all %>%
+      dplyr::filter(.data$series == .env$series,
+                    .data$response == .env$resp_name) %>%
+      dplyr::select(value, all_of(predictor)) %>%
+      dplyr::filter(is.finite(.data$value), is.finite(.data[[predictor]]))
+    
+    x <- dat[[predictor]]
+    y <- dat$value
+    
+    kt <- suppressWarnings(cor.test(x, y, method = "kendall", exact = TRUE))
+    ts <- theil_sen_fit(x, y)
+    pt <- perm_test(x, y, kendall_tau, B = 10000, seed = 1)
+    
+    tibble(
+      series           = series,
+      response         = resp_name,
+      predictor        = predictor,
+      n                = length(y),
+      kendall_tau      = as.numeric(unname(kt$estimate)),
+      kendall_p_exact  = as.numeric(kt$p.value),
+      perm_p_tau       = as.numeric(pt$p_value),
+      theil_sen_slope  = as.numeric(ts$slope),
+      theil_sen_int    = as.numeric(ts$intercept)
+    )
+  })
+
+results
+
+# Optional: rank within each series/response by |tau|
+# results %>% group_by(series, response) %>% arrange(desc(abs(kendall_tau)), .by_group = TRUE)
+
+# Save output:
+readr::write_csv(
+  results,
+  here::here("output", "site_characteristics_vs_model_performance.csv")
+)
+
+# Filter for only relationships with p < 0.1
+sig_results_either <- results %>%
+  filter(kendall_p_exact < 0.1 | perm_p_tau < 0.1) %>%
+  arrange(series, response, pmin(kendall_p_exact, perm_p_tau))
+
+sig_results_either
+
+# Save output:
+readr::write_csv(
+  sig_results_either,
+  here::here("output", "site_characteristics_vs_model_performance_significant.csv")
+)
+
+```
+
+```{r Plot significant relationships}
+# Plot predictor vs metric for all methods; add Theil–Sen fit line ONLY where p < 0.1
+# Uses your existing helper theil_sen_fit(x, y) and results table for significance.
+
+# Safety: if results is accidentally a list, coerce once
+results <- dplyr::bind_rows(results)
+
+plot_pred_vs_metric_sig_thielsen <- function(df_all,
+                                             results,
+                                             predictor,
+                                             metric,
+                                             metric_y_lab = NULL,
+                                             outfile = NULL,
+                                             p_thresh = 0.1,
+                                             facet_nrow = 1,
+                                             facet_scales = "free_y") {
+  stopifnot(is.character(predictor), length(predictor) == 1)
+  stopifnot(is.character(metric),    length(metric) == 1)
+  
+  # 1) Identify significant methods (min of Kendall exact + permutation p)
+  sig_methods <- results %>%
+    filter(response == metric, predictor == predictor) %>%
+    mutate(p_use = pmin(kendall_p_exact, perm_p_tau, na.rm = TRUE)) %>%
+    filter(is.finite(p_use), p_use < p_thresh) %>%
+    select(series, p_use)
+  
+  # 2) Plotting data: predictor + metric value
+  plot_df <- df_all %>%
+    filter(response == metric) %>%
+    transmute(
+      Site_ID,
+      series,
+      x = .data[[predictor]],
+      y = value
+    ) %>%
+    filter(is.finite(x), is.finite(y)) %>%
+    left_join(sig_methods, by = "series") %>%
+    mutate(is_sig = !is.na(p_use))
+  
+  # 3) Compute Theil–Sen line params per series (for significant series only)
+  ts_lines <- plot_df %>%
+    filter(is_sig) %>%
+    group_by(series) %>%
+    summarise(
+      ts = list(theil_sen_fit(x, y)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      slope = map_dbl(ts, "slope"),
+      intercept = map_dbl(ts, "intercept")
+    ) %>%
+    select(series, slope, intercept)
+  
+  # 4) Expand to segment endpoints (so lines don't interpolate across gaps)
+  ts_segments <- plot_df %>%
+    filter(is_sig) %>%
+    group_by(series) %>%
+    summarise(
+      x_min = min(x, na.rm = TRUE),
+      x_max = max(x, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    left_join(ts_lines, by = "series") %>%
+    mutate(
+      y_min = intercept + slope * x_min,
+      y_max = intercept + slope * x_max
+    )
+  
+  # Default y label
+  if (is.null(metric_y_lab)) {
+    metric_y_lab <- if (metric == "r2") expression(R^2) else toupper(metric)
+  }
+  
+  # Default outfile
+  if (is.null(outfile)) {
+    outfile <- paste0(predictor, "_vs_", metric, "_all_methods_sig_thielsen.png")
+  }
+  
+  # 5) Plot: points for all; Theil–Sen segment only for significant series
+  p <- ggplot(plot_df, aes(x = x, y = y, color = series)) +
+    geom_point(size = 2, alpha = 0.85) +
+    geom_segment(
+      data = ts_segments,
+      aes(x = x_min, xend = x_max, y = y_min, yend = y_max, color = series),
+      linewidth = 0.9,
+      inherit.aes = FALSE
+    ) +
+    facet_wrap(~ series, nrow = facet_nrow, scales = facet_scales) +
+    labs(
+      x = predictor,
+      y = metric_y_lab,
+      color = NULL
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position = "none",
+      panel.grid.minor = element_blank(),
+      strip.background = element_blank()
+    )
+  
+  # 6) Save
+  ggsave(
+    filename = here::here("figures", outfile),
+    plot = p,
+    width = 12,
+    height = 4,
+    dpi = 300,
+    bg = "white"
+  )
+  
+  list(plot = p, plot_df = plot_df, sig_methods = sig_methods, ts_segments = ts_segments)
+}
+
+# -----------------------------
+# Figure 1: Z* vs R2 (Theil–Sen fit where p < 0.1)
+# -----------------------------
+out_z_r2_ts <- plot_pred_vs_metric_sig_thielsen(
+  df_all    = df_all,
+  results   = results,
+  predictor = "Z_star",
+  metric    = "r2",
+  metric_y_lab = expression(R^2),
+  outfile   = "Zstar_vs_R2_all_methods_sig_thielsen.png"
+)
+
+# -----------------------------
+# Figure 2: Z* vs RMSE (Theil–Sen fit where p < 0.1)
+# -----------------------------
+out_z_rmse_ts <- plot_pred_vs_metric_sig_thielsen(
+  df_all    = df_all,
+  results   = results,
+  predictor = "Salinity_iqr",
+  metric    = "rmse",
+  metric_y_lab = "RMSE",
+  outfile   = "sal_iqr_vs_RMSE_all_methods_sig_thielsen.png"
+)
+
+print(out_z_r2_ts$plot)
+print(out_z_rmse_ts$plot)
+
+```
+
+## diurnal-wtd-salinity-ta-env
+```{r diurnal-wtd-salinity-ta-env, message=FALSE, warning=FALSE}
+# Diurnal (hour-of-day) mean ± SD for WTD (m), Salinity (ppt), and TA (C)
+# Facetted by SITE (2 rows: up to 4 sites per row), one PNG per variable.
+# Uses df_ss, which was already constructed earlier for the flux diurnal stats.
+
+# Rename sites
+df_ss <- df_ss %>%
+  dplyr::mutate(
+    SITE = gsub("_.*", "", SITE),                     # remove _dates
+    SITE = paste0(
+      substr(SITE, 1, 2), "-",                        # first 2 letters
+      substr(SITE, nchar(SITE) - 2, nchar(SITE))      # last 3 letters
+    )
+  )
+
+# Replace SITE in plot_base_best with the exact Site_ID strings
+df_ss <- df_ss %>%
+  mutate(SITE_UPPER = toupper(SITE)) %>%           # key in same format
+  left_join(site_id_lookup, by = "SITE_UPPER") %>% # bring in Site_ID
+  mutate(SITE = Site_ID) %>%                       # overwrite SITE
+  select(-SITE_UPPER, -Site_ID)                    # drop helper cols
+
+if (exists("df_ss")) {
+  
+  env_vars <- intersect(c("WTD", "Salinity", "TA"), names(df_ss))
+  
+  if (length(env_vars) > 0) {
+    
+    # ---- All-season diurnal (original behavior) ----
+    diurnal_env <- df_ss %>%
+      dplyr::select(SITE, tod, dplyr::all_of(env_vars)) %>%
+      dplyr::mutate(SITE_LABEL = strip_years(SITE)) %>%
+      tidyr::pivot_longer(
+        cols      = dplyr::all_of(env_vars),
+        names_to  = "Variable",
+        values_to = "Value"
+      ) %>%
+      dplyr::filter(is.finite(tod), is.finite(Value)) %>%
+      dplyr::group_by(Variable, SITE_LABEL, tod) %>%
+      dplyr::summarise(
+        mean_value = mean(Value, na.rm = TRUE),
+        sd_value   = sd(Value,   na.rm = TRUE),
+        .groups    = "drop"
+      )
+    
+    # Make a separate facetted PNG for each variable (all seasons combined)
+    for (v in unique(diurnal_env$Variable)) {
+      
+      p_dat <- dplyr::filter(diurnal_env, Variable == v)
+      if (nrow(p_dat) == 0) next
+      
+      # Units + mean ± SD information for y-axis label
+      y_lab <- dplyr::case_when(
+        v == "WTD"      ~ "WTD (m)",
+        v == "Salinity" ~ "Salinity (ppt)",
+        v == "TA"       ~ "Air temperature (°C)",
+        TRUE            ~ "Mean ± SD"
+      )
+      
+      p_env <- ggplot(p_dat, aes(x = tod, y = mean_value)) +
+        geom_ribbon(aes(ymin = mean_value - sd_value,
+                        ymax = mean_value + sd_value),
+                    alpha = 0.25) +
+        geom_line(linewidth = 0.8) +
+        geom_vline(xintercept = c(6, 18), linetype = "dashed", color = "grey40") +
+        scale_x_continuous(breaks = seq(0, 24, by = 4),
+                           limits = c(0, 24)) +
+        facet_wrap(~ SITE_LABEL, scales = "fixed", nrow = 2) +
+        labs(
+          title = NULL,
+          x     = "Hour of day",
+          y     = y_lab
+        ) +
+        theme_minimal()
+      
+      print(p_env)
+      
+      outfile <- paste0("Diurnal_", gsub(" ", "_", v), "_bySite.png")
+      ggsave(filename = here::here("figures", outfile),
+             plot  = p_env,
+             width = 10, height = 8,
+             dpi   = 300, bg = "white")
+    }
+    
+    # ---- Season-specific diurnals: Spring & Summer ----
+    diurnal_env_season <- df_ss %>%
+      dplyr::select(SITE, season, tod, dplyr::all_of(env_vars)) %>%
+      dplyr::mutate(SITE_LABEL = strip_years(SITE)) %>%
+      tidyr::pivot_longer(
+        cols      = dplyr::all_of(env_vars),
+        names_to  = "Variable",
+        values_to = "Value"
+      ) %>%
+      dplyr::filter(
+        season %in% c("Spring", "Summer"),
+        is.finite(tod),
+        is.finite(Value)
+      ) %>%
+      dplyr::group_by(Variable, SITE_LABEL, season, tod) %>%
+      dplyr::summarise(
+        mean_value = mean(Value, na.rm = TRUE),
+        sd_value   = sd(Value,   na.rm = TRUE),
+        .groups    = "drop"
+      )
+    
+    # Separate Spring/Summer plots per variable
+    for (v in unique(diurnal_env_season$Variable)) {
+      
+      for (sea in c("Spring", "Summer")) {
+        
+        p_dat <- diurnal_env_season %>%
+          dplyr::filter(Variable == v, season == sea)
+        
+        if (nrow(p_dat) == 0) next
+        
+        y_lab <- dplyr::case_when(
+          v == "WTD"      ~ "WTD (m)",
+          v == "Salinity" ~ "Salinity (ppt)",
+          v == "TA"       ~ "Air temperature (°C)",
+          TRUE            ~ paste0(sea, " mean ± SD")
+        )
+        
+        p_env <- ggplot(p_dat, aes(x = tod, y = mean_value)) +
+          geom_ribbon(aes(ymin = mean_value - sd_value,
+                          ymax = mean_value + sd_value),
+                      alpha = 0.25) +
+          geom_line(linewidth = 0.8) +
+          geom_vline(xintercept = c(6, 18), linetype = "dashed", color = "grey40") +
+          scale_x_continuous(breaks = seq(0, 24, by = 6),
+                             limits = c(0, 24)) +
+          facet_wrap(~ SITE_LABEL, scales = "free_y", nrow = 2) +
+          labs(
+            title = NULL,
+            x     = "Hour of day",
+            y     = y_lab
+          ) +
+          theme_minimal()
+        
+        print(p_env)
+        
+        outfile <- paste0(
+          "Diurnal_", gsub(" ", "_", v), "_", sea, "_bySite.png"
+        )
+        ggsave(filename = here::here("figures", outfile),
+               plot  = p_env,
+               width = 10, height = 8,
+               dpi   = 300, bg = "white")
+      }
+    }
+    
+  }
+}
+```
+
+## usedn-isotope-timeseries
+```{r usedn-isotope-timeseries, message=FALSE, warning=FALSE}
+# USEDN_2020-2024 time series (Tramontana, nighttime/daytime, isotope) during isotope campaign overlap
+
+# Colors by raw series keys (NOT labels)
+if (!exists("method_cols")) {
+  method_cols <- c(
+    # Tramontana (same color for GPP and RECO)
+    "Tramontana_bestmodel_GPP"  = "#1f77b4",
+    "Tramontana_bestmodel_RECO" = "#1f77b4",
+    "Tram_GPP"                  = "#1f77b4",
+    "Tram_RECO"                 = "#1f77b4",
+    
+    # Nighttime method (same color for GPP and RECO)
+    "NT_GPP"  = "#9467bd",
+    "NT_RECO" = "#9467bd",
+    
+    # Daytime method (same color for GPP and RECO)
+    "DT_GPP"  = "#2ca02c",
+    "DT_RECO" = "#2ca02c",
+    
+    # Isotope method (same color for GPP and RECO)
+    "GPP_isotope_night0" = "#17becf",
+    "Reco_isotope"       = "#17becf",
+    
+    # NEE for isotope comparison method
+    "NEE_RAW" = "grey60"
+  )
+}
+
+iso_file <- here::here("data", "Isotope_EDN.csv")
+
+if (file.exists(iso_file) && exists("df_subset_orig")) {
+  
+  iso_raw <- readr::read_csv(iso_file, show_col_types = FALSE)
+  
+  iso_proc <- iso_raw %>%
+    filter(!is.na(datetime)) %>%
+    mutate(
+      ISO_TIMESTAMP = lubridate::ymd_hms(as.character(datetime), tz = "UTC")
+    ) %>%
+    select(
+      ISO_TIMESTAMP,
+      GPP_isotope_night0,
+      Reco_isotope
+    )
+  
+  usedn_base <- df_subset_orig %>%
+    filter(SITE == "USEDN_2020-2024") %>%
+    select(
+      SITE, TIMESTAMP,
+      Tram_GPP  = bestmodel_GPP,
+      Tram_RECO = bestmodel_RECO,
+      any_of(c("DT_GPP", "NT_GPP", "DT_RECO", "NT_RECO", "NEE_RAW"))
+    )
+  
+  usedn_join <- usedn_base %>%
+    inner_join(iso_proc, by = c("TIMESTAMP" = "ISO_TIMESTAMP"))
+  
+  if (nrow(usedn_join) > 0) {
+    
+    # -----------------------------
+    # GPP time series (plot uptake as positive: flip sign for model GPP only)
+    # -----------------------------
+    gpp_cols <- c("Tram_GPP", "NT_GPP", "DT_GPP", "GPP_isotope_night0")
+    gpp_present <- intersect(gpp_cols, names(usedn_join))
+    
+    if (length(gpp_present) > 1) {
+      
+      ts_gpp <- usedn_join %>%
+        pivot_longer(
+          cols      = all_of(gpp_present),
+          names_to  = "series",
+          values_to = "flux"
+        ) %>%
+        mutate(
+          flux = if_else(series %in% c("Tram_GPP", "NT_GPP", "DT_GPP"), -flux, flux),
+          series = factor(series, levels = gpp_cols)
+        )
+      
+      # Labels for legend (keep as character strings; parse later)
+      gpp_labels <- c(
+        "Tram_GPP"           = "ANN[BEST]",
+        "NT_GPP"             = "Nighttime GPP",
+        "DT_GPP"             = "Daytime GPP",
+        "GPP_isotope_night0" = "Isotope GPP (night0)"
+      )
+      
+      # Colors mapped to raw series keys
+      gpp_colors <- c(
+        "Tram_GPP"           = unname(method_cols["Tram_GPP"]),
+        "NT_GPP"             = unname(method_cols["NT_GPP"]),
+        "DT_GPP"             = unname(method_cols["DT_GPP"]),
+        "GPP_isotope_night0" = unname(method_cols["GPP_isotope_night0"])
+      )
+      
+      p_ts_gpp <- ggplot(ts_gpp, aes(x = TIMESTAMP, y = flux, color = series)) +
+        geom_line(alpha = 0.8, linewidth = 0.7) +
+        scale_color_manual(values = gpp_colors, labels = gpp_labels, drop = TRUE) +
+        guides(color = guide_legend(label.parsed = TRUE), fill = "none") +
+        labs(
+          title = "USEDN_2020-2024 — GPP time series (isotope overlap)",
+          x     = "Time",
+          y     = expression(GPP~(mu*mol~CO[2]~m^{-2}~s^{-1})),
+          color = NULL
+        ) +
+        theme_minimal() +
+        theme(legend.position = "bottom")
+      
+      print(p_ts_gpp)
+      
+      ggsave(
+        filename = here::here("figures", "USEDN_Timeseries_GPP_Tram_NT_DT_Isotope.png"),
+        plot = p_ts_gpp,
+        width = 10, height = 4,
+        dpi = 300, bg = "white"
+      )
+    }
+    
+    # -----------------------------
+    # RECO time series
+    # -----------------------------
+    reco_cols <- c("Tram_RECO", "NT_RECO", "DT_RECO", "Reco_isotope")
+    reco_present <- intersect(reco_cols, names(usedn_join))
+    
+    if (length(reco_present) > 1) {
+      
+      ts_reco <- usedn_join %>%
+        pivot_longer(
+          cols      = all_of(reco_present),
+          names_to  = "series",
+          values_to = "flux"
+        ) %>%
+        mutate(series = factor(series, levels = reco_cols))
+      
+      reco_labels <- c(
+        "Tram_RECO"    = "ANN[BEST]",
+        "NT_RECO"      = "Nighttime Reco",
+        "DT_RECO"      = "Daytime Reco",
+        "Reco_isotope" = "Isotope Reco"
+      )
+      
+      reco_colors <- c(
+        "Tram_RECO"    = unname(method_cols["Tram_RECO"]),
+        "NT_RECO"      = unname(method_cols["NT_RECO"]),
+        "DT_RECO"      = unname(method_cols["DT_RECO"]),
+        "Reco_isotope" = unname(method_cols["Reco_isotope"])
+      )
+      
+      p_ts_reco <- ggplot(ts_reco, aes(x = TIMESTAMP, y = flux, color = series)) +
+        geom_line(alpha = 0.8, linewidth = 0.7) +
+        scale_color_manual(values = reco_colors, labels = reco_labels, drop = TRUE) +
+        guides(color = guide_legend(label.parsed = TRUE), fill = "none") +
+        labs(
+          title = "USEDN_2020-2024 — Reco time series (isotope overlap)",
+          x     = "Time",
+          y     = expression(RECO~(mu*mol~CO[2]~m^{-2}~s^{-1})),
+          color = NULL
+        ) +
+        theme_minimal() +
+        theme(legend.position = "bottom")
+      
+      print(p_ts_reco)
+      
+      ggsave(
+        filename = here::here("figures", "USEDN_Timeseries_RECO_Tram_NT_DT_Isotope.png"),
+        plot = p_ts_reco,
+        width = 10, height = 4,
+        dpi = 300, bg = "white"
+      )
+    }
+  }
+}
+```
+
+## usedn-isotope-vs-tram-nt
+```{r usedn-isotope-vs-tram-nt, message=FALSE, warning=FALSE}
+# Compare isotope-derived GPP/Reco to Tramontana and nighttime methods
+# for USEDN_2020-2024, restricted to periods where isotope data exist.
+
+# -------------------------
+# 0) Prep: time-of-day
+# -------------------------
+usedn_join <- usedn_join %>%
+  mutate(tod = hour(TIMESTAMP) + minute(TIMESTAMP) / 60)
+
+# -------------------------
+# 1) Legend mapping helper
+# -------------------------
+label_map <- c(
+  "ANNBEST"   = expression(ANN[BEST]),
+  "Nighttime" = "Nighttime",
+  "Daytime"   = "Daytime",
+  "Isotope"   = "Isotope",
+  "NEE"       = expression(NEE[night])
+)
+
+# -------------------------
+# 2) GPP diurnal
+# -------------------------
+gpp_cols <- c("Tram_GPP", "NT_GPP", "DT_GPP", "GPP_isotope_night0")
+gpp_present <- intersect(gpp_cols, names(usedn_join))
+
+if (length(gpp_present) > 1) {
+  
+  gpp_key <- c(
+    "Tram_GPP"           = "ANNBEST",
+    "NT_GPP"             = "Nighttime",
+    "DT_GPP"             = "Daytime",
+    "GPP_isotope_night0" = "Isotope"
+  )
+  
+  gpp_pal <- c(
+    "ANNBEST"   = unname(method_cols["Tram_GPP"]),
+    "Nighttime" = unname(method_cols["NT_GPP"]),
+    "Daytime"   = unname(method_cols["DT_GPP"]),
+    "Isotope"   = unname(method_cols["GPP_isotope_night0"])
+  )
+  
+  gpp_diurnal <- usedn_join %>%
+    pivot_longer(all_of(gpp_present), names_to = "series", values_to = "flux") %>%
+    mutate(
+      # Flip sign for model-based GPP only
+      flux = if_else(series %in% c("Tram_GPP", "NT_GPP", "DT_GPP"), -flux, flux),
+      key  = recode(series, !!!gpp_key),
+      key  = factor(key, levels = c("ANNBEST", "Daytime", "Nighttime", "Isotope"))
+    ) %>%
+    group_by(key, tod) %>%
+    summarise(
+      mean_flux = mean(flux, na.rm = TRUE),
+      sd_flux   = sd(flux,   na.rm = TRUE),
+      .groups   = "drop"
+    )
+  
+  p_gpp <- ggplot(gpp_diurnal, aes(tod, mean_flux, color = key, fill = key)) +
+    geom_ribbon(aes(ymin = mean_flux - sd_flux, ymax = mean_flux + sd_flux),
+                alpha = 0.25, color = NA) +
+    geom_line(linewidth = 0.9) +
+    geom_vline(xintercept = c(6, 18), linetype = "dashed", color = "grey40") +
+    scale_color_manual(values = gpp_pal, labels = label_map, drop = TRUE) +
+    scale_fill_manual(values  = gpp_pal, labels = label_map, drop = TRUE) +
+    guides(
+      color = guide_legend(title = NULL, label.parsed = TRUE),
+      fill  = guide_legend(title = NULL, label.parsed = TRUE)
+    ) +
+    scale_x_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
+    labs(
+      x = "Time of day",
+      y = expression(GPP~(mu*mol~CO[2]~m^{-2}~s^{-1}))
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p_gpp)
+  
+  ggsave(
+    filename = here::here("figures", "USEDN_Diurnal_GPP_Tram_NT_DT_Isotope.png"),
+    plot = p_gpp, width = 8, height = 6, dpi = 300, bg = "white"
+  )
+}
+
+# -------------------------
+# 3) RECO diurnal (plus nighttime-only NEE)
+# -------------------------
+reco_cols <- c("Tram_RECO", "NT_RECO", "DT_RECO", "Reco_isotope", "NEE_RAW")
+reco_present <- intersect(reco_cols, names(usedn_join))
+
+if (length(reco_present) > 1) {
+  
+  reco_key <- c(
+    "Tram_RECO"    = "ANNBEST",
+    "NT_RECO"      = "Nighttime",
+    "DT_RECO"      = "Daytime",
+    "Reco_isotope" = "Isotope",
+    "NEE_RAW"      = "NEE"
+  )
+  
+  reco_pal <- c(
+    "ANNBEST"   = unname(method_cols["Tram_RECO"]),
+    "Nighttime" = unname(method_cols["NT_RECO"]),
+    "Daytime"   = unname(method_cols["DT_RECO"]),
+    "Isotope"   = unname(method_cols["Reco_isotope"]),
+    "NEE"       = unname(method_cols["NEE_RAW"])
+  )
+  
+  usedn_join_filtered <- usedn_join %>%
+    mutate(NEE_RAW = if_else(tod > 5 & tod < 18, NA_real_, NEE_RAW))
+  
+  reco_diurnal <- usedn_join_filtered %>%
+    pivot_longer(all_of(reco_present), names_to = "series", values_to = "flux") %>%
+    mutate(
+      key = recode(series, !!!reco_key),
+      key = factor(key, levels = c("ANNBEST", "Daytime", "Nighttime", "Isotope", "NEE"))
+    ) %>%
+    group_by(key, tod) %>%
+    summarise(
+      mean_flux = mean(flux, na.rm = TRUE),
+      sd_flux   = sd(flux,   na.rm = TRUE),
+      .groups   = "drop"
+    )
+  
+  p_reco <- ggplot(reco_diurnal, aes(tod, mean_flux, color = key, fill = key)) +
+    geom_ribbon(aes(ymin = mean_flux - sd_flux, ymax = mean_flux + sd_flux),
+                alpha = 0.25, color = NA) +
+    geom_line(linewidth = 0.9) +
+    geom_vline(xintercept = c(6, 18), linetype = "dashed", color = "grey40") +
+    scale_color_manual(values = reco_pal, labels = label_map, drop = TRUE) +
+    scale_fill_manual(values  = reco_pal, labels = label_map, drop = TRUE) +
+    guides(
+      color = guide_legend(title = NULL, label.parsed = TRUE),
+      fill  = guide_legend(title = NULL, label.parsed = TRUE)
+    ) +
+    scale_x_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
+    labs(
+      x = "Time of day",
+      y = expression(RECO~(mu*mol~CO[2]~m^{-2}~s^{-1}))
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p_reco)
+  
+  ggsave(
+    filename = here::here("figures", "USEDN_Diurnal_RECO_Tram_NT_DT_Isotope.png"),
+    plot = p_reco, width = 8, height = 6, dpi = 300, bg = "white"
+  )
+}
+```
+
+```{r stats for isotope period}
+
+calc_stats <- function(obs, pred) {
+  df <- tibble(obs = obs, pred = pred) %>% drop_na()
+  
+  if (nrow(df) < 3) return(tibble(r2 = NA, rmse = NA, n = nrow(df)))
+  
+  fit <- lm(obs ~ pred, data = df)
+  preds <- predict(fit)
+  
+  tibble(
+    r2   = summary(fit)$r.squared,
+    rmse = Metrics::rmse(df$obs, preds),
+    n    = nrow(df)
+  )
+}
+
+results <- list(
+  Tram_RECO   = calc_stats(usedn_join_filtered$Reco_isotope,
+                           usedn_join_filtered$Tram_RECO),
+  
+  NT_RECO     = calc_stats(usedn_join_filtered$Reco_isotope,
+                           usedn_join_filtered$NT_RECO),
+  
+  DT_RECO     = calc_stats(usedn_join_filtered$Reco_isotope,
+                           usedn_join_filtered$DT_RECO),
+  
+  NEE_RAW     = calc_stats(usedn_join_filtered$Reco_isotope,
+                           usedn_join_filtered$NEE_RAW)
+)
+
+comparison_stats <- bind_rows(results, .id = "model")
+comparison_stats
+```
