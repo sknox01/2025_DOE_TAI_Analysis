@@ -10,6 +10,9 @@ output:
 ---
 
 ```{r setup, message=FALSE, warning=FALSE}
+
+# Note chatGPT was used to help streamline some of the code below.
+
 suppressPackageStartupMessages({
   library(tidyverse)
   library(vroom)
@@ -36,7 +39,7 @@ options(stringsAsFactors = FALSE, scipen = 999)
 
 ```{r paths-helpers}
 # --- Paths (edit base_dir to your repo path if needed) ---
-base_dir <- "/Users/saraknox/Code/nee-partition"
+base_dir <- "/Users/saraknox/Code/nee-partition" # this is the directory for the folder 'nee-partition' from the repository https://github.com/onur-kocer/nee-partition/tree/main (make sure to download it first)
 #base_dir <- "C:/Users/Eddie/Documents/GitHub/nee-partition-main"
 pred_dir <- file.path(base_dir, "model_predictions")
 data_dir <- file.path(base_dir, "data")
