@@ -29,6 +29,11 @@ suppressPackageStartupMessages({
   library(here)
   library(stringr)
   library(readr)
+  library(reshape2)
+  library(corrplot)
+  library(Hmisc)  # for rcorr()
+  library(patchwork)
+  library(ggrepel)
 })
 
 knitr::opts_chunk$set(message = FALSE, warning = FALSE)
@@ -181,7 +186,7 @@ time_map <- all %>%
 
 # Keep TIME plus any extra state variables we care about from the normalized files
 keep_core   <- c('SITE_PLOT', 'variant_row', 'TIME')
-extra_state <- intersect(c('WTD', 'Salinity', 'TA'), names(time_map))
+extra_state <- intersect(c('WTD', 'Salinity', 'TA', 'VPD','WS','WD_COS','WD_SIN'), names(time_map))
 
 time_map <- time_map %>%
   dplyr::select(dplyr::all_of(keep_core), dplyr::all_of(extra_state)) %>%
@@ -506,7 +511,7 @@ p_best <- ggplot(plot_data_best, aes(x = Reco, y = NEE_RAW)) +
   geom_point(color = "black", alpha = 0.35) +
   geom_smooth(aes(color = series), method = "lm", se = FALSE) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
-  facet_wrap(~ SITE, scales = "free") +
+  facet_wrap(~ SITE, ncol = 4, scales = "free") +
   scale_color_manual(
     values = c(
       "DT_RECO" = "#2ca02c",
@@ -1219,6 +1224,111 @@ ggsave(
 )
 ```
 
+## Correlations between predictors
+
+```{r correlation-matrix-by-site, message=FALSE, warning=FALSE}
+# Correlation matrix with significance testing, upper triangle, hierarchical
+# clustering, per site. Uses Spearman (non-parametric) correlation.
+# Significant correlations (p < 0.05) are shown; non-significant are crossed out.
+
+# -------------------------
+# 0) Variables of interest
+# -------------------------
+cor_vars <- c("WTD", "Salinity", "TA", "SW_IN_RAW", "VPD", "WS", "WD_SIN", "WD_COS")
+
+var_labels <- c(
+  "WTD"       = "WTD",
+  "Salinity"  = "Salinity",
+  "TA"        = "TA",
+  "SW_IN_RAW" = "SW_IN",
+  "VPD"       = "VPD",
+  "WS"        = "WS",
+  "WD_SIN"    = "WD (sin)",
+  "WD_COS"    = "WD (cos)"
+)
+
+sites <- sort(unique(df_subset$SITE))
+
+# -------------------------
+# Helper function to avoid duplicating corrplot call
+# -------------------------
+plot_one_site <- function(site) {
+  d <- df_subset %>%
+    filter(SITE == site) %>%
+    dplyr::select(any_of(cor_vars)) %>%
+    drop_na()
+  
+  vars_present <- intersect(cor_vars, names(d))
+  if (length(vars_present) < 3 || nrow(d) < 10) {
+    plot.new(); title(main = site, cex.main = 1.4); return(invisible(NULL))
+  }
+  
+  d <- d[, vars_present, drop = FALSE]
+  colnames(d) <- var_labels[vars_present]
+  
+  res   <- Hmisc::rcorr(as.matrix(d), type = "spearman")
+  r_mat <- res$r
+  p_mat <- res$P
+  p_mat[is.na(p_mat)] <- 0
+  
+  corrplot(
+    r_mat,
+    type        = "upper",
+    order       = "original",   # <-- changed from "hclust"
+    tl.col      = "black",
+    tl.srt      = 45,
+    tl.cex      = 0.9,
+    method      = "color",
+    col         = colorRampPalette(c("#d73027", "white", "#4575b4"))(200),
+    addCoef.col = "black",
+    number.cex  = 0.7,
+    p.mat       = p_mat,
+    sig.level   = 0.05,
+    insig       = "pch",
+    pch         = 4,
+    pch.cex     = 1.5,
+    pch.col     = "purple",
+    cl.cex      = 0.8,
+    mar         = c(0, 0, 3, 0),
+    title       = site,
+    cex.main    = 1.1
+  )
+}
+
+# -------------------------
+# Save to file — larger canvas to accommodate bigger text
+# -------------------------
+png(
+  filename = here::here("figures", "Correlation_Matrix_Spearman_bySite.png"),
+  width    = 14,
+  height   = 8,
+  units    = "in",
+  res      = 150,    # key change — lower dpi makes text larger relative to canvas
+  bg       = "white"
+)
+
+par(mfrow = c(2, 4), mar = c(1, 1, 4, 1), oma = c(0, 0, 3, 0))  # no cex here
+for (site in sites) plot_one_site(site)
+#mtext(
+#  "Spearman correlation (X = non-significant, p ≥ 0.05)",
+#  outer = TRUE, cex = 1.2, line = 0.8
+#)
+dev.off()
+
+# -------------------------
+# Print to screen
+# -------------------------
+par(mfrow = c(2, 4), mar = c(1, 1, 4, 1), oma = c(0, 0, 3, 0))
+for (site in sites) plot_one_site(site)
+mtext(
+  "Spearman correlation (X = non-significant, p ≥ 0.05)",
+  outer = TRUE, cex = 1.4, line = 0.8
+)
+par(mfrow = c(1, 1))
+
+```
+
+
 ```{r summarize site characteristics}
 
 # Recalculate site-level median and IQR using years with > 40% of the data for each variable
@@ -1855,138 +1965,161 @@ readr::write_csv(
 # Safety: if results is accidentally a list, coerce once
 results <- dplyr::bind_rows(results)
 
-plot_pred_vs_metric_sig_thielsen <- function(df_all,
-                                             results,
-                                             predictor,
-                                             metric,
-                                             metric_y_lab = NULL,
-                                             outfile = NULL,
-                                             p_thresh = 0.1,
-                                             facet_nrow = 1,
-                                             facet_scales = "free_y") {
-  stopifnot(is.character(predictor), length(predictor) == 1)
-  stopifnot(is.character(metric),    length(metric) == 1)
-  
-  # 1) Identify significant methods (min of Kendall exact + permutation p)
-  sig_methods <- results %>%
-    filter(response == metric, predictor == predictor) %>%
-    mutate(p_use = pmin(kendall_p_exact, perm_p_tau, na.rm = TRUE)) %>%
-    filter(is.finite(p_use), p_use < p_thresh) %>%
-    select(series, p_use)
-  
-  # 2) Plotting data: predictor + metric value
-  plot_df <- df_all %>%
-    filter(response == metric) %>%
-    transmute(
-      Site_ID,
-      series,
-      x = .data[[predictor]],
-      y = value
+# ---- Shared display settings (ANN_BEST, Daytime, Nighttime order) ----
+series_levels <- c("Tramontana_bestmodel_RECO", "DT_RECO", "NT_RECO")
+
+# Plotmath STRINGS (parsed by label_parsed) — not expression() objects
+series_strip <- c(
+  "Tramontana_bestmodel_RECO" = "ANN[BEST]",
+  "DT_RECO"                   = "Daytime",
+  "NT_RECO"                   = "Nighttime"
+)
+
+# For the (hidden) color scale legend, expression labels are fine
+series_labels <- c(
+  "Tramontana_bestmodel_RECO" = expression(ANN[BEST]),
+  "DT_RECO"                   = "Daytime",
+  "NT_RECO"                   = "Nighttime"
+)
+
+series_palette <- c(
+  "Tramontana_bestmodel_RECO" = "#1f77b4",
+  "DT_RECO"                   = "#2ca02c",
+  "NT_RECO"                   = "#9467bd"
+)
+
+# Returns a single-row (3 method facets) ggplot for one predictor/metric
+panel_pred_vs_metric <- function(df_all,
+                                 results,
+                                 predictor_var,
+                                 metric,
+                                 predictor_x_lab = NULL,
+                                 metric_y_lab = NULL,
+                                 p_thresh = 0.1,
+                                 show_strip = TRUE,
+                                 facet_scales = "free_y") {
+  stopifnot(is.character(predictor_var), length(predictor_var) == 1)
+  stopifnot(is.character(metric),        length(metric) == 1)
+
+  # Stats per method (tau + permutation p)
+  stat_tbl <- results %>%
+    filter(.data$response == .env$metric,
+           .data$predictor == .env$predictor_var) %>%
+    mutate(
+      p_use  = pmin(kendall_p_exact, perm_p_tau, na.rm = TRUE),
+      is_sig = is.finite(p_use) & p_use < p_thresh
     ) %>%
+    select(series, kendall_tau, perm_p_tau, p_use, is_sig)
+
+  sig_methods <- stat_tbl %>% filter(is_sig) %>% select(series, p_use)
+
+  plot_df <- df_all %>%
+    filter(.data$response == .env$metric) %>%
+    transmute(Site_ID, series, x = .data[[predictor_var]], y = value) %>%
     filter(is.finite(x), is.finite(y)) %>%
     left_join(sig_methods, by = "series") %>%
-    mutate(is_sig = !is.na(p_use))
-  
-  # 3) Compute Theil–Sen line params per series (for significant series only)
+    mutate(is_sig = !is.na(p_use)) %>%
+    filter(series %in% series_levels) %>%
+    mutate(series = factor(series, levels = series_levels))
+
   ts_lines <- plot_df %>%
     filter(is_sig) %>%
     group_by(series) %>%
-    summarise(
-      ts = list(theil_sen_fit(x, y)),
-      .groups = "drop"
-    ) %>%
-    mutate(
-      slope = map_dbl(ts, "slope"),
-      intercept = map_dbl(ts, "intercept")
-    ) %>%
+    summarise(ts = list(theil_sen_fit(x, y)), .groups = "drop") %>%
+    mutate(slope = map_dbl(ts, "slope"), intercept = map_dbl(ts, "intercept")) %>%
     select(series, slope, intercept)
-  
-  # 4) Expand to segment endpoints (so lines don't interpolate across gaps)
+
   ts_segments <- plot_df %>%
     filter(is_sig) %>%
     group_by(series) %>%
-    summarise(
-      x_min = min(x, na.rm = TRUE),
-      x_max = max(x, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
+    summarise(x_min = min(x, na.rm = TRUE), x_max = max(x, na.rm = TRUE), .groups = "drop") %>%
     left_join(ts_lines, by = "series") %>%
     mutate(
       y_min = intercept + slope * x_min,
-      y_max = intercept + slope * x_max
+      y_max = intercept + slope * x_max,
+      series = factor(series, levels = series_levels)
     )
-  
-  # Default y label
+
+  annot_df <- stat_tbl %>%
+    filter(series %in% series_levels) %>%
+    mutate(
+      series = factor(series, levels = series_levels),
+      p_txt  = ifelse(perm_p_tau < 0.001, "p < 0.001",
+                      paste0("p == ", formatC(perm_p_tau, format = "f", digits = 3))),
+      label  = paste0("tau == ", formatC(kendall_tau, format = "f", digits = 2),
+                      "~~~~", p_txt)
+    ) %>%
+    select(series, label)
+
   if (is.null(metric_y_lab)) {
-    metric_y_lab <- if (metric == "r2") expression(R^2) else toupper(metric)
+    metric_y_lab <- switch(metric,
+      r2    = expression(R^2),
+      rmse  = expression(RMSE~(mu*mol~CO[2]~m^{-2}~s^{-1})),
+      slope = "Slope",
+      toupper(metric))
   }
-  
-  # Default outfile
-  if (is.null(outfile)) {
-    outfile <- paste0(predictor, "_vs_", metric, "_all_methods_sig_thielsen.png")
-  }
-  
-  # 5) Plot: points for all; Theil–Sen segment only for significant series
-  p <- ggplot(plot_df, aes(x = x, y = y, color = series)) +
-    geom_point(size = 2, alpha = 0.85) +
+  if (is.null(predictor_x_lab)) predictor_x_lab <- predictor_var
+
+  ggplot(plot_df, aes(x = x, y = y, color = series)) +
     geom_segment(
       data = ts_segments,
       aes(x = x_min, xend = x_max, y = y_min, yend = y_max, color = series),
-      linewidth = 0.9,
-      inherit.aes = FALSE
+      linewidth = 1, inherit.aes = FALSE
     ) +
-    facet_wrap(~ series, nrow = facet_nrow, scales = facet_scales) +
-    labs(
-      x = predictor,
-      y = metric_y_lab,
-      color = NULL
+    geom_point(size = 2.6, alpha = 0.9) +
+    geom_text(
+      data = annot_df, aes(x = -Inf, y = Inf, label = label),
+      parse = TRUE, inherit.aes = FALSE,
+      hjust = -0.08, vjust = 1.4, size = 3.2, color = "grey20"
     ) +
-    theme_bw(base_size = 11) +
+    facet_wrap(~ series, nrow = 1, scales = facet_scales,
+               labeller = labeller(series = as_labeller(series_strip, label_parsed))) +
+    scale_color_manual(values = series_palette, labels = series_labels, drop = FALSE) +
+    labs(x = predictor_x_lab, y = metric_y_lab, color = NULL) +
+    theme_bw(base_size = 12) +
     theme(
-      legend.position = "none",
+      legend.position  = "none",
       panel.grid.minor = element_blank(),
-      strip.background = element_blank()
+      panel.grid.major = element_line(color = "grey92"),
+      strip.background = element_rect(fill = "grey95", color = NA),
+      strip.text       = if (show_strip) element_text(face = "bold", size = 11) else element_blank(),
+      axis.title       = element_text(size = 12),
+      plot.margin      = margin(4, 10, 4, 6)
     )
-  
-  # 6) Save
-  ggsave(
-    filename = here::here("figures", outfile),
-    plot = p,
-    width = 12,
-    height = 4,
-    dpi = 300,
-    bg = "white"
-  )
-  
-  list(plot = p, plot_df = plot_df, sig_methods = sig_methods, ts_segments = ts_segments)
 }
 
-# -----------------------------
-# Figure 1: Z* vs R2 (Theil–Sen fit where p < 0.1)
-# -----------------------------
-out_z_r2_ts <- plot_pred_vs_metric_sig_thielsen(
-  df_all    = df_all,
-  results   = results,
-  predictor = "Z_star",
-  metric    = "r2",
-  metric_y_lab = expression(R^2),
-  outfile   = "Zstar_vs_R2_all_methods_sig_thielsen.png"
+# ---- Build the three rows ----
+p_r2 <- panel_pred_vs_metric(
+  df_all, results, predictor_var = "Z_star", metric = "r2",
+  predictor_x_lab = expression(Z*"*"), metric_y_lab = expression(R^2),
+  show_strip = TRUE
 )
 
-# -----------------------------
-# Figure 2: Z* vs RMSE (Theil–Sen fit where p < 0.1)
-# -----------------------------
-out_z_rmse_ts <- plot_pred_vs_metric_sig_thielsen(
-  df_all    = df_all,
-  results   = results,
-  predictor = "Salinity_iqr",
-  metric    = "rmse",
-  metric_y_lab = "RMSE",
-  outfile   = "sal_iqr_vs_RMSE_all_methods_sig_thielsen.png"
+p_slope <- panel_pred_vs_metric(
+  df_all, results, predictor_var = "Z_star", metric = "slope",
+  predictor_x_lab = expression(Z*"*"), metric_y_lab = "Slope",
+  show_strip = FALSE
 )
 
-print(out_z_r2_ts$plot)
-print(out_z_rmse_ts$plot)
+p_rmse <- panel_pred_vs_metric(
+  df_all, results, predictor_var = "Salinity_iqr", metric = "rmse",
+  predictor_x_lab = "Salinity IQR (ppt)",
+  metric_y_lab = expression(RMSE~(mu*mol~CO[2]~m^{-2}~s^{-1})),
+  show_strip = FALSE
+)
+
+# ---- Combine into one figure (R2 on top, then slope, then RMSE) ----
+combined_metrics <- p_r2 / p_slope / p_rmse +
+  plot_annotation(tag_levels = "a", tag_suffix = ")") &
+  theme(plot.tag = element_text(face = "bold", size = 12))
+
+ggsave(
+  filename = here::here("figures", "SiteChar_vs_Performance_R2_Slope_RMSE.png"),
+  plot = combined_metrics,
+  width = 11, height = 10, dpi = 300, bg = "white"
+)
+
+print(combined_metrics)
 
 ```
 
@@ -2157,19 +2290,19 @@ if (!exists("method_cols")) {
     "Tramontana_bestmodel_RECO" = "#1f77b4",
     "Tram_GPP"                  = "#1f77b4",
     "Tram_RECO"                 = "#1f77b4",
-    
+
     # Nighttime method (same color for GPP and RECO)
     "NT_GPP"  = "#9467bd",
     "NT_RECO" = "#9467bd",
-    
+
     # Daytime method (same color for GPP and RECO)
     "DT_GPP"  = "#2ca02c",
     "DT_RECO" = "#2ca02c",
-    
+
     # Isotope method (same color for GPP and RECO)
     "GPP_isotope_night0" = "#17becf",
     "Reco_isotope"       = "#17becf",
-    
+
     # NEE for isotope comparison method
     "NEE_RAW" = "grey60"
   )
@@ -2178,9 +2311,9 @@ if (!exists("method_cols")) {
 iso_file <- here::here("data", "Isotope_EDN.csv")
 
 if (file.exists(iso_file) && exists("df_subset_orig")) {
-  
+
   iso_raw <- readr::read_csv(iso_file, show_col_types = FALSE)
-  
+
   iso_proc <- iso_raw %>%
     filter(!is.na(datetime)) %>%
     mutate(
@@ -2191,7 +2324,7 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
       GPP_isotope_night0,
       Reco_isotope
     )
-  
+
   usedn_base <- df_subset_orig %>%
     filter(SITE == "USEDN_2020-2024") %>%
     select(
@@ -2200,20 +2333,20 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
       Tram_RECO = bestmodel_RECO,
       any_of(c("DT_GPP", "NT_GPP", "DT_RECO", "NT_RECO", "NEE_RAW"))
     )
-  
+
   usedn_join <- usedn_base %>%
     inner_join(iso_proc, by = c("TIMESTAMP" = "ISO_TIMESTAMP"))
-  
+
   if (nrow(usedn_join) > 0) {
-    
+
     # -----------------------------
     # GPP time series (plot uptake as positive: flip sign for model GPP only)
     # -----------------------------
-    gpp_cols <- c("Tram_GPP", "NT_GPP", "DT_GPP", "GPP_isotope_night0")
-    gpp_present <- intersect(gpp_cols, names(usedn_join))
-    
+    gpp_levels <- c("Tram_GPP", "DT_GPP", "NT_GPP", "GPP_isotope_night0")
+    gpp_present <- intersect(gpp_levels, names(usedn_join))
+
     if (length(gpp_present) > 1) {
-      
+
       ts_gpp <- usedn_join %>%
         pivot_longer(
           cols      = all_of(gpp_present),
@@ -2222,40 +2355,42 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
         ) %>%
         mutate(
           flux = if_else(series %in% c("Tram_GPP", "NT_GPP", "DT_GPP"), -flux, flux),
-          series = factor(series, levels = gpp_cols)
+          series = factor(series, levels = gpp_levels)
         )
-      
-      # Labels for legend (keep as character strings; parse later)
+
+      # Plotmath strings (parsed in legend)
       gpp_labels <- c(
         "Tram_GPP"           = "ANN[BEST]",
-        "NT_GPP"             = "Nighttime GPP",
-        "DT_GPP"             = "Daytime GPP",
-        "GPP_isotope_night0" = "Isotope GPP (night0)"
+        "DT_GPP"             = "Daytime",
+        "NT_GPP"             = "Nighttime",
+        "GPP_isotope_night0" = "Isotope"
       )
-      
-      # Colors mapped to raw series keys
+
       gpp_colors <- c(
         "Tram_GPP"           = unname(method_cols["Tram_GPP"]),
-        "NT_GPP"             = unname(method_cols["NT_GPP"]),
         "DT_GPP"             = unname(method_cols["DT_GPP"]),
+        "NT_GPP"             = unname(method_cols["NT_GPP"]),
         "GPP_isotope_night0" = unname(method_cols["GPP_isotope_night0"])
       )
-      
+
       p_ts_gpp <- ggplot(ts_gpp, aes(x = TIMESTAMP, y = flux, color = series)) +
         geom_line(alpha = 0.8, linewidth = 0.7) +
-        scale_color_manual(values = gpp_colors, labels = gpp_labels, drop = TRUE) +
-        guides(color = guide_legend(label.parsed = TRUE), fill = "none") +
+        scale_color_manual(
+          values = gpp_colors,
+          labels = function(x) parse(text = gpp_labels[x]),
+          drop = TRUE
+        ) +
+        guides(fill = "none") +
         labs(
-          title = "USEDN_2020-2024 — GPP time series (isotope overlap)",
           x     = "Time",
           y     = expression(GPP~(mu*mol~CO[2]~m^{-2}~s^{-1})),
           color = NULL
         ) +
         theme_minimal() +
         theme(legend.position = "bottom")
-      
+
       print(p_ts_gpp)
-      
+
       ggsave(
         filename = here::here("figures", "USEDN_Timeseries_GPP_Tram_NT_DT_Isotope.png"),
         plot = p_ts_gpp,
@@ -2263,52 +2398,55 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
         dpi = 300, bg = "white"
       )
     }
-    
+
     # -----------------------------
     # RECO time series
     # -----------------------------
-    reco_cols <- c("Tram_RECO", "NT_RECO", "DT_RECO", "Reco_isotope")
-    reco_present <- intersect(reco_cols, names(usedn_join))
-    
+    reco_levels <- c("Tram_RECO", "DT_RECO", "NT_RECO", "Reco_isotope")
+    reco_present <- intersect(reco_levels, names(usedn_join))
+
     if (length(reco_present) > 1) {
-      
+
       ts_reco <- usedn_join %>%
         pivot_longer(
           cols      = all_of(reco_present),
           names_to  = "series",
           values_to = "flux"
         ) %>%
-        mutate(series = factor(series, levels = reco_cols))
-      
+        mutate(series = factor(series, levels = reco_levels))
+
       reco_labels <- c(
         "Tram_RECO"    = "ANN[BEST]",
-        "NT_RECO"      = "Nighttime Reco",
-        "DT_RECO"      = "Daytime Reco",
-        "Reco_isotope" = "Isotope Reco"
+        "DT_RECO"      = "Daytime",
+        "NT_RECO"      = "Nighttime",
+        "Reco_isotope" = "Isotope"
       )
-      
+
       reco_colors <- c(
         "Tram_RECO"    = unname(method_cols["Tram_RECO"]),
-        "NT_RECO"      = unname(method_cols["NT_RECO"]),
         "DT_RECO"      = unname(method_cols["DT_RECO"]),
+        "NT_RECO"      = unname(method_cols["NT_RECO"]),
         "Reco_isotope" = unname(method_cols["Reco_isotope"])
       )
-      
+
       p_ts_reco <- ggplot(ts_reco, aes(x = TIMESTAMP, y = flux, color = series)) +
         geom_line(alpha = 0.8, linewidth = 0.7) +
-        scale_color_manual(values = reco_colors, labels = reco_labels, drop = TRUE) +
-        guides(color = guide_legend(label.parsed = TRUE), fill = "none") +
+        scale_color_manual(
+          values = reco_colors,
+          labels = function(x) parse(text = reco_labels[x]),
+          drop = TRUE
+        ) +
+        guides(fill = "none") +
         labs(
-          title = "USEDN_2020-2024 — Reco time series (isotope overlap)",
           x     = "Time",
           y     = expression(RECO~(mu*mol~CO[2]~m^{-2}~s^{-1})),
           color = NULL
         ) +
         theme_minimal() +
         theme(legend.position = "bottom")
-      
+
       print(p_ts_reco)
-      
+
       ggsave(
         filename = here::here("figures", "USEDN_Timeseries_RECO_Tram_NT_DT_Isotope.png"),
         plot = p_ts_reco,
@@ -2473,6 +2611,123 @@ if (length(reco_present) > 1) {
   )
 }
 ```
+```{r usedn-isotope-env-diurnal, message=FALSE, warning=FALSE}
+# Diurnal mean ± SD for environmental drivers during the isotope campaign
+# at US-EDN (Aug 21 – Sep 5, 2022). Multi-panel, one variable per facet.
+
+# -------------------------
+# 0) Define isotope campaign window
+# -------------------------
+iso_start <- as.POSIXct("2022-08-21 00:00:00", tz = "UTC")
+iso_end   <- as.POSIXct("2022-09-05 23:59:59", tz = "UTC")
+
+# -------------------------
+# 1) Filter to US-EDN during isotope period
+# -------------------------
+usedn_label <- grep("USEDN", unique(df_subset_orig$SITE), value = TRUE, ignore.case = TRUE)
+
+env_vars_iso <- c("SW_IN_RAW", "TA", "VPD", "WS", "WD_COS", "WD_SIN")
+
+usedn_iso_env <- df_subset_orig %>%
+  filter(
+    SITE %in% usedn_label,
+    TIMESTAMP >= iso_start,
+    TIMESTAMP <= iso_end
+  ) %>%
+  mutate(tod = hour(TIMESTAMP) + minute(TIMESTAMP) / 60) %>%
+  select(TIMESTAMP, tod, any_of(env_vars_iso))
+
+vars_present <- intersect(env_vars_iso, names(usedn_iso_env))
+
+diurnal_iso_env <- usedn_iso_env %>%
+  select(tod, all_of(vars_present)) %>%
+  pivot_longer(
+    cols      = all_of(vars_present),
+    names_to  = "Variable",
+    values_to = "Value"
+  ) %>%
+  filter(is.finite(tod), is.finite(Value)) %>%
+  group_by(Variable, tod) %>%
+  summarise(
+    mean_value = mean(Value, na.rm = TRUE),
+    sd_value   = sd(Value,   na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  mutate(
+    Variable = factor(
+      Variable,
+      levels = c("SW_IN_RAW", "TA", "VPD", "WS", "WD_COS", "WD_SIN")
+    )
+  )
+
+# -------------------------
+# Custom y-axis labeller using plotmath expressions
+# -------------------------
+var_labeller <- as_labeller(
+  c(
+    "SW_IN_RAW" = "SW~radiation~(W~m^{2})",
+    "TA"        = "Air~temperature~(degree*C)",
+    "VPD"       = "VPD~(hPa)",
+    "WS"        = "Wind~speed~(m~s^{1})",
+    "WD_COS"    = "Wind~direction~(cos)",
+    "WD_SIN"    = "Wind~direction~(sin)"
+  ),
+  default = label_parsed
+)
+
+# -------------------------
+# 2) Plot
+# -------------------------
+p_iso_env <- ggplot(diurnal_iso_env, aes(x = tod, y = mean_value)) +
+  geom_ribbon(
+    aes(ymin = mean_value - sd_value, ymax = mean_value + sd_value),
+    fill  = "grey70",
+    alpha = 0.4,
+    color = NA
+  ) +
+  geom_line(linewidth = 0.8, color = "black") +
+  geom_vline(
+    xintercept = c(6, 18),
+    linetype   = "dashed",
+    color      = "grey40",
+    linewidth  = 0.4
+  ) +
+  facet_wrap(
+    ~ Variable,
+    scales   = "free_y",
+    ncol     = 3,
+    labeller = var_labeller,
+    strip.position = "left"   # move strip to left as y-axis label
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 24, by = 6),
+    limits = c(0, 24)
+  ) +
+  labs(
+    title = NULL,
+    x     = "Hour of day",
+    y     = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor  = element_blank(),
+    strip.text.y.left = element_text(size = 10, angle = 90),
+    strip.placement   = "outside",   # place strip outside plot area
+    axis.title.y      = element_blank()
+  )
+
+print(p_iso_env)
+
+ggsave(
+  filename = here::here("figures", "USEDN_Isotope_Period_Diurnal_EnvDrivers.png"),
+  plot     = p_iso_env,
+  width    = 10,
+  height   = 7,
+  dpi      = 300,
+  bg       = "white"
+)
+```
+
 
 ```{r stats for isotope period}
 
