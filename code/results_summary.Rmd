@@ -391,6 +391,32 @@ best_models <- model_results %>%
 
 # alias if later code calls safe_fit()
 safe_fit <- fit_stats
+
+# Day-block bootstrap CI for the regression slope.
+# Resamples whole days with replacement to respect within-day autocorrelation.
+slope_ci_block <- function(df, n_boot = 1000, seed = 42) {
+  if (nrow(df) < 3 || !"TIMESTAMP" %in% names(df))
+    return(tibble(slope_lo = NA_real_, slope_hi = NA_real_, n_days = NA_integer_))
+
+  d <- df %>%
+    filter(is.finite(Reco), is.finite(NEE_RAW)) %>%
+    mutate(day = as.Date(TIMESTAMP))
+
+  days <- unique(d$day)
+  if (length(days) < 10)
+    return(tibble(slope_lo = NA_real_, slope_hi = NA_real_, n_days = length(days)))
+
+  set.seed(seed)
+  slopes <- replicate(n_boot, {
+    samp <- tibble(day = sample(days, length(days), replace = TRUE)) %>%
+      left_join(d, by = "day", relationship = "many-to-many")
+    if (var(samp$Reco, na.rm = TRUE) == 0) return(NA_real_)
+    unname(coef(lm(NEE_RAW ~ Reco, data = samp))[2])
+  })
+
+  q <- quantile(slopes, c(0.025, 0.975), na.rm = TRUE)
+  tibble(slope_lo = unname(q[1]), slope_hi = unname(q[2]), n_days = length(days))
+}
 ```
 
 ```{r bestmodel-extract}
@@ -501,9 +527,15 @@ plot_base_best <- plot_base_best %>%
 
 model_results_best <- plot_base_best %>%
   group_by(SITE, series) %>%
-  group_modify(~safe_fit(.x %>% rename(Reco = Reco, NEE_RAW = NEE_RAW))) %>%
+  group_modify(~ bind_cols(safe_fit(.x), slope_ci_block(.x))) %>%
   ungroup() %>%
   mutate(equation = sprintf('NEE = %.2f + %.2f x\nR² = %.2f  RMSE = %.2f', intercept, slope, r2, rmse))
+
+# model_results_best <- plot_base_best %>%
+#   group_by(SITE, series) %>%
+#   group_modify(~safe_fit(.x %>% rename(Reco = Reco, NEE_RAW = NEE_RAW))) %>%
+#   ungroup() %>%
+#   mutate(equation = sprintf('NEE = %.2f + %.2f x\nR² = %.2f  RMSE = %.2f', intercept, slope, r2, rmse))
 
 plot_data_best <- left_join(plot_base_best, model_results_best, by = c('SITE','series'))
 
@@ -543,6 +575,45 @@ ggsave(
   bg = "white"
 )
 
+plot_data_best <- left_join(plot_base_best, model_results_best,
+                            by = c('SITE','series')) %>%
+  mutate(series = factor(series,
+    levels = c("Tramontana_bestmodel_RECO", "DT_RECO", "NT_RECO")))
+
+series_cols <- c(
+  "Tramontana_bestmodel_RECO" = "#1f77b4",
+  "DT_RECO"                   = "#2ca02c",
+  "NT_RECO"                   = "#9467bd"
+)
+
+series_labs <- c(
+  "Tramontana_bestmodel_RECO" = expression(ANN[BEST]),
+  "DT_RECO"                   = "Daytime",
+  "NT_RECO"                   = "Nighttime"
+)
+
+p_best <- ggplot(plot_data_best, aes(x = Reco, y = NEE_RAW, color = series)) +
+  geom_point(alpha = 0.2, size = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ SITE, ncol = 4, scales = "free") +
+  scale_color_manual(values = series_cols, labels = series_labs,
+                     breaks = names(series_cols)) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 2),
+                              label.parsed = TRUE)) +
+  labs(
+    title = NULL,
+    color = NULL,
+    x = expression("Modeled RECO"["night"]~(mu*mol~m^{-2}~s^{-1})),
+    y = expression("Measured NEE"["night"]~(mu*mol~m^{-2}~s^{-1}))
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+ggsave(here::here("figures", "Nighttime_NEE_vs_Reco_bySite_BEST_by_colour.png"),
+       p_best, width = 12, height = 7, dpi = 300, bg = "white")
+
+
 readr::write_csv(
   model_results_best %>% arrange(SITE, desc(r2)),
   here::here("output", "Nighttime_NEE_vs_Reco_stats_BEST.csv")
@@ -553,9 +624,15 @@ plot_base_base <- bind_rows(dt_nt_long, base_tram) %>% drop_na(Reco, NEE_RAW)
 
 model_results_base <- plot_base_base %>%
   group_by(SITE, series) %>%
-  group_modify(~safe_fit(.x %>% rename(Reco = Reco, NEE_RAW = NEE_RAW))) %>%
+  group_modify(~ bind_cols(safe_fit(.x), slope_ci_block(.x))) %>%
   ungroup() %>%
   mutate(equation = sprintf('NEE = %.2f + %.2f x\nR² = %.2f  RMSE = %.2f', intercept, slope, r2, rmse))
+
+# model_results_base <- plot_base_base %>%
+#   group_by(SITE, series) %>%
+#   group_modify(~safe_fit(.x %>% rename(Reco = Reco, NEE_RAW = NEE_RAW))) %>%
+#   ungroup() %>%
+#   mutate(equation = sprintf('NEE = %.2f + %.2f x\nR² = %.2f  RMSE = %.2f', intercept, slope, r2, rmse))
 
 plot_data_base <- left_join(plot_base_base, model_results_base, by = c('SITE','series'))
 
@@ -1036,7 +1113,9 @@ if (all(c("SITE", "NEE_RAW") %in% names(df_subset))) {
 # Layout is similar to Nighttime_NEE_vs_Reco_bySite_COMBINED.png
 
 # Rename sites
-df_subset_orig <- df_subset # Keep original data frame for below when plotting isotopes
+if (!exists("df_subset_orig")) {
+  df_subset_orig <- df_subset  # keep pre-rename labels for the isotope chunks
+}
 
 df_subset <- df_subset %>%
   dplyr::mutate(
@@ -1070,81 +1149,57 @@ make_ts_plot <- function(value_col, outfile, ylab) {
   d <- df_subset %>%
     dplyr::filter(!is.na(TIMESTAMP)) %>%
     dplyr::select(SITE, TIMESTAMP, value = dplyr::all_of(value_col)) %>%
+    dplyr::filter(is.finite(value)) %>%
     dplyr::mutate(SITE_LABEL = strip_years(SITE))
   
   if (nrow(d) == 0) return(invisible(NULL))
   
-  # --- Facet layout like COMBINED plot ---
-  sites <- sort(unique(d$SITE_LABEL))
-  n     <- length(sites)
-  ncol  <- if (n <= 3) n else 4
-  if (ncol == 0) ncol <- 1
-  rem       <- n %% ncol
-  pad       <- if (rem == 0) 0 else (ncol - rem)
-  left_pad  <- floor(pad / 2)
-  right_pad <- ceiling(pad / 2)
-  pad_levels <- if (pad > 0) paste0("pad", seq_len(pad)) else character(0)
+  # Plot-only exclusion: interpolated salinity at US-EDN (not removed from df_subset)
+  if (value_col == "Salinity") {
+    d <- d %>%
+      dplyr::filter(
+        !(SITE_LABEL == "US-EDN" &
+            TIMESTAMP >= as.POSIXct("2022-01-01", tz = "UTC") &
+            TIMESTAMP <  as.POSIXct("2023-01-01", tz = "UTC"))
+      )
+    if (nrow(d) == 0) return(invisible(NULL))
+  }
   
-  levels_all <- c(
-    pad_levels[seq_len(left_pad)],
-    sites,
-    if (pad > 0) pad_levels[(left_pad + 1):pad] else character(0)
-  )
-  
+  # Break lines across gaps; seg_id must be unique across sites
   d <- d %>%
-    dplyr::mutate(SITE_LABEL_F = factor(SITE_LABEL, levels = levels_all)) %>%
-    dplyr::arrange(SITE_LABEL_F, TIMESTAMP) %>%
-    dplyr::group_by(SITE_LABEL_F) %>%
+    dplyr::arrange(SITE_LABEL, TIMESTAMP) %>%
+    dplyr::group_by(SITE_LABEL) %>%
     dplyr::mutate(
-      dt_hours  = as.numeric(difftime(TIMESTAMP, dplyr::lag(TIMESTAMP), units = "hours")),
-      ref_dt    = median(dt_hours, na.rm = TRUE),
-      gap_flag  = dplyr::if_else(is.na(dt_hours) | dt_hours <= 1.5 * ref_dt, 0L, 1L),
-      seg_id    = cumsum(dplyr::coalesce(gap_flag, 0L))
+      dt_hours = as.numeric(difftime(TIMESTAMP, dplyr::lag(TIMESTAMP), units = "hours")),
+      ref_dt   = stats::median(dt_hours, na.rm = TRUE),
+      gap_flag = dplyr::if_else(
+        is.na(dt_hours) | (dt_hours <= 1.5 * ref_dt & dt_hours <= 24),
+        0L, 1L
+      ),
+      seg_id   = paste0(SITE_LABEL, "_", cumsum(dplyr::coalesce(gap_flag, 0L)))
     ) %>%
     dplyr::ungroup()
   
-  lab_map <- stats::setNames(
-    as.list(ifelse(grepl("^pad", levels_all), "", levels_all)),
-    levels_all
-  )
-  
   p <- ggplot(d, aes(x = TIMESTAMP, y = value, group = seg_id)) +
     geom_line(alpha = 0.8, linewidth = 0.4) +
-    facet_wrap(
-      ~ SITE_LABEL_F,
-      ncol   = ncol,
-      scales = "free_x",
-      drop   = FALSE,
-      labeller = labeller(SITE_LABEL_F = lab_map)
-    ) +
-    labs(
-      title = paste0("Time series of ", ylab, " by site"),
-      x = "Time",
-      y = ylab
-    ) +
+    facet_wrap(~ SITE_LABEL, nrow = 2, scales = "free") +
+    labs(title = NULL, x = "Time", y = ylab) +
     theme_minimal() +
-    theme(
-      panel.grid.minor = element_blank(),
-      strip.text       = element_text(size = 8)
-    )
+    theme(panel.grid.minor = element_blank())
   
   ggsave(
     filename = here::here("figures", outfile),
     plot = p,
-    width = 12,
-    height = 7,
-    dpi = 300,
-    bg = "white"
+    width = 10, height = 8,
+    dpi   = 300, bg = "white"
   )
-  
 }
 
-# Map friendly names to column names
 ts_specs <- list(
-  WTD      = list(col = "WTD",      ylab = "Water table depth"),
-  Salinity = list(col = "Salinity", ylab = "Salinity"),
-  TA       = list(col = "TA",       ylab = "TA"),
-  NEE      = list(col = "NEE_RAW",  ylab = "NEE (NEE_RAW)")
+  WTD      = list(col = "WTD",      ylab = "WTD (m)"),
+  Salinity = list(col = "Salinity", ylab = "Salinity (ppt)"),
+  TA       = list(col = "TA",       ylab = "Air temperature (°C)"),
+  NEE      = list(col = "NEE_RAW",  ylab = expression(NEE~(mu*mol~CO[2]~m^-2~s^-1)))
 )
 
 for (nm in names(ts_specs)) {
@@ -1154,6 +1209,56 @@ for (nm in names(ts_specs)) {
     make_ts_plot(spec$col, outfile, spec$ylab)
   }
 }
+
+
+# --- Diel salinity and WTD composites by site (summer) ---
+diel_sal_wtd <- df_subset_orig %>%
+  filter(month(TIMESTAMP) %in% 6:8) %>%
+  mutate(SITE_LABEL = strip_years(SITE),
+         tod = hour(TIMESTAMP) + minute(TIMESTAMP) / 60) %>%
+  select(SITE_LABEL, tod, Salinity, WTD) %>%
+  pivot_longer(c(Salinity, WTD), names_to = "Variable", values_to = "Value") %>%
+  filter(is.finite(Value)) %>%
+  group_by(SITE_LABEL, Variable, tod) %>%
+  summarise(mean_value = mean(Value), n = n(), .groups = "drop") %>%
+  group_by(SITE_LABEL, Variable) %>%
+  mutate(scaled = as.numeric(scale(mean_value))) %>%
+  ungroup()
+
+# Correlation and diel amplitude per site
+diel_summary <- diel_sal_wtd %>%
+  select(SITE_LABEL, Variable, tod, mean_value) %>%
+  pivot_wider(names_from = Variable, values_from = mean_value) %>%
+  group_by(SITE_LABEL) %>%
+  summarise(
+    r            = cor(Salinity, WTD, use = "complete.obs"),
+    amp_salinity = max(Salinity, na.rm = TRUE) - min(Salinity, na.rm = TRUE),
+    amp_WTD      = max(WTD, na.rm = TRUE) - min(WTD, na.rm = TRUE),
+    n_tod        = sum(is.finite(Salinity) & is.finite(WTD)),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(r))
+
+print(diel_summary, n = Inf)
+
+# readr::write_csv(diel_summary,
+#                  here::here("output", "diel_salinity_wtd_summary.csv"))
+
+# Figure
+p_sal_wtd <- ggplot(diel_sal_wtd, aes(tod, scaled, colour = Variable)) +
+  geom_line(linewidth = 0.7) +
+  geom_vline(xintercept = c(6, 18), linetype = "dashed",
+             colour = "grey40", linewidth = 0.4) +
+  facet_wrap(~ SITE_LABEL, nrow = 2) +
+  scale_x_continuous(breaks = seq(0, 24, 6), limits = c(0, 24)) +
+  labs(x = "Hour of day", y = "Standardized diel anomaly", colour = NULL) +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+
+print(p_sal_wtd)
+
+ggsave(here::here("figures", "Diel_Salinity_WTD_bySite.png"),
+       p_sal_wtd, width = 10, height = 6, dpi = 300, bg = "white")
 
 # NEE Plots
 # -----------------------------
@@ -1222,6 +1327,39 @@ ggsave(
   units    = "in",
   dpi      = 300
 )
+
+spec_by_site <- df_subset_orig %>%
+  mutate(SITE_LABEL = strip_years(SITE)) %>%
+  filter(is.finite(WTD)) %>%
+  arrange(SITE_LABEL, TIMESTAMP) %>%
+  group_by(SITE_LABEL) %>%
+  group_modify(~ {
+    x  <- .x$WTD
+    if (length(x) < 2000) return(tibble(period_h = NA_real_, power = NA_real_, rank = NA_integer_))
+    sp <- spec.pgram(ts(x, frequency = 48), taper = 0.1, log = "no", plot = FALSE)
+    tibble(period_h = (1 / sp$freq) / 2, power = sp$spec) %>%
+      filter(period_h > 8, period_h < 30) %>%
+      arrange(desc(power)) %>%
+      slice_head(n = 5) %>%
+      mutate(rank = row_number())
+  }) %>%
+  ungroup()
+
+print(spec_by_site, n = 40)
+
+install.packages("lomb")
+library(lomb)
+d <- df_subset_orig %>%
+  mutate(SITE_LABEL = strip_years(SITE)) %>%
+  filter(SITE_LABEL == "USSTJ", is.finite(WTD)) %>%
+  mutate(t_hours = as.numeric(difftime(TIMESTAMP, min(TIMESTAMP), units = "hours")))
+
+nrow(d)
+
+ls <- lsp(x = d$WTD, times = d$t_hours, from = 1/30, to = 1/8,
+          type = "frequency", ofac = 4, plot = FALSE)
+tibble(period_h = 1 / ls$scanned, power = ls$power) %>%
+  arrange(desc(power)) %>% head(10)
 ```
 
 ## Correlations between predictors
@@ -2000,7 +2138,7 @@ panel_pred_vs_metric <- function(df_all,
                                  facet_scales = "free_y") {
   stopifnot(is.character(predictor_var), length(predictor_var) == 1)
   stopifnot(is.character(metric),        length(metric) == 1)
-
+  
   # Stats per method (tau + permutation p)
   stat_tbl <- results %>%
     filter(.data$response == .env$metric,
@@ -2010,9 +2148,9 @@ panel_pred_vs_metric <- function(df_all,
       is_sig = is.finite(p_use) & p_use < p_thresh
     ) %>%
     select(series, kendall_tau, perm_p_tau, p_use, is_sig)
-
+  
   sig_methods <- stat_tbl %>% filter(is_sig) %>% select(series, p_use)
-
+  
   plot_df <- df_all %>%
     filter(.data$response == .env$metric) %>%
     transmute(Site_ID, series, x = .data[[predictor_var]], y = value) %>%
@@ -2021,14 +2159,14 @@ panel_pred_vs_metric <- function(df_all,
     mutate(is_sig = !is.na(p_use)) %>%
     filter(series %in% series_levels) %>%
     mutate(series = factor(series, levels = series_levels))
-
+  
   ts_lines <- plot_df %>%
     filter(is_sig) %>%
     group_by(series) %>%
     summarise(ts = list(theil_sen_fit(x, y)), .groups = "drop") %>%
     mutate(slope = map_dbl(ts, "slope"), intercept = map_dbl(ts, "intercept")) %>%
     select(series, slope, intercept)
-
+  
   ts_segments <- plot_df %>%
     filter(is_sig) %>%
     group_by(series) %>%
@@ -2039,7 +2177,7 @@ panel_pred_vs_metric <- function(df_all,
       y_max = intercept + slope * x_max,
       series = factor(series, levels = series_levels)
     )
-
+  
   annot_df <- stat_tbl %>%
     filter(series %in% series_levels) %>%
     mutate(
@@ -2050,16 +2188,16 @@ panel_pred_vs_metric <- function(df_all,
                       "~~~~", p_txt)
     ) %>%
     select(series, label)
-
+  
   if (is.null(metric_y_lab)) {
     metric_y_lab <- switch(metric,
-      r2    = expression(R^2),
-      rmse  = expression(RMSE~(mu*mol~CO[2]~m^{-2}~s^{-1})),
-      slope = "Slope",
-      toupper(metric))
+                           r2    = expression(R^2),
+                           rmse  = expression(RMSE~(mu*mol~CO[2]~m^{-2}~s^{-1})),
+                           slope = "Slope",
+                           toupper(metric))
   }
   if (is.null(predictor_x_lab)) predictor_x_lab <- predictor_var
-
+  
   ggplot(plot_df, aes(x = x, y = y, color = series)) +
     geom_segment(
       data = ts_segments,
@@ -2091,13 +2229,13 @@ panel_pred_vs_metric <- function(df_all,
 # ---- Build the three rows ----
 p_r2 <- panel_pred_vs_metric(
   df_all, results, predictor_var = "Z_star", metric = "r2",
-  predictor_x_lab = expression(Z*"*"), metric_y_lab = expression(R^2),
+  predictor_x_lab = expression(Z*"*"[MHW]), metric_y_lab = expression(R^2),
   show_strip = TRUE
 )
 
 p_slope <- panel_pred_vs_metric(
   df_all, results, predictor_var = "Z_star", metric = "slope",
-  predictor_x_lab = expression(Z*"*"), metric_y_lab = "Slope",
+  predictor_x_lab = expression(Z*"*"[MHW]), metric_y_lab = "Slope",
   show_strip = FALSE
 )
 
@@ -2290,19 +2428,19 @@ if (!exists("method_cols")) {
     "Tramontana_bestmodel_RECO" = "#1f77b4",
     "Tram_GPP"                  = "#1f77b4",
     "Tram_RECO"                 = "#1f77b4",
-
+    
     # Nighttime method (same color for GPP and RECO)
     "NT_GPP"  = "#9467bd",
     "NT_RECO" = "#9467bd",
-
+    
     # Daytime method (same color for GPP and RECO)
     "DT_GPP"  = "#2ca02c",
     "DT_RECO" = "#2ca02c",
-
+    
     # Isotope method (same color for GPP and RECO)
     "GPP_isotope_night0" = "#17becf",
     "Reco_isotope"       = "#17becf",
-
+    
     # NEE for isotope comparison method
     "NEE_RAW" = "grey60"
   )
@@ -2311,9 +2449,9 @@ if (!exists("method_cols")) {
 iso_file <- here::here("data", "Isotope_EDN.csv")
 
 if (file.exists(iso_file) && exists("df_subset_orig")) {
-
+  
   iso_raw <- readr::read_csv(iso_file, show_col_types = FALSE)
-
+  
   iso_proc <- iso_raw %>%
     filter(!is.na(datetime)) %>%
     mutate(
@@ -2324,29 +2462,37 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
       GPP_isotope_night0,
       Reco_isotope
     )
-
+  
+  usedn_label <- grep("USEDN|US-EDN", unique(df_subset_orig$SITE),
+                      value = TRUE, ignore.case = TRUE)
+  usedn_label <- setdiff(usedn_label, "USEDN_2020-2021")
+  
+  if (length(usedn_label) == 0) {
+    warning("No US-EDN site label found in df_subset_orig")
+  }
+  
   usedn_base <- df_subset_orig %>%
-    filter(SITE == "USEDN_2020-2024") %>%
+    filter(SITE %in% usedn_label) %>%
     select(
       SITE, TIMESTAMP,
       Tram_GPP  = bestmodel_GPP,
       Tram_RECO = bestmodel_RECO,
       any_of(c("DT_GPP", "NT_GPP", "DT_RECO", "NT_RECO", "NEE_RAW"))
     )
-
+  
   usedn_join <- usedn_base %>%
     inner_join(iso_proc, by = c("TIMESTAMP" = "ISO_TIMESTAMP"))
-
+  
   if (nrow(usedn_join) > 0) {
-
+    
     # -----------------------------
     # GPP time series (plot uptake as positive: flip sign for model GPP only)
     # -----------------------------
     gpp_levels <- c("Tram_GPP", "DT_GPP", "NT_GPP", "GPP_isotope_night0")
     gpp_present <- intersect(gpp_levels, names(usedn_join))
-
+    
     if (length(gpp_present) > 1) {
-
+      
       ts_gpp <- usedn_join %>%
         pivot_longer(
           cols      = all_of(gpp_present),
@@ -2357,7 +2503,7 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
           flux = if_else(series %in% c("Tram_GPP", "NT_GPP", "DT_GPP"), -flux, flux),
           series = factor(series, levels = gpp_levels)
         )
-
+      
       # Plotmath strings (parsed in legend)
       gpp_labels <- c(
         "Tram_GPP"           = "ANN[BEST]",
@@ -2365,14 +2511,14 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
         "NT_GPP"             = "Nighttime",
         "GPP_isotope_night0" = "Isotope"
       )
-
+      
       gpp_colors <- c(
         "Tram_GPP"           = unname(method_cols["Tram_GPP"]),
         "DT_GPP"             = unname(method_cols["DT_GPP"]),
         "NT_GPP"             = unname(method_cols["NT_GPP"]),
         "GPP_isotope_night0" = unname(method_cols["GPP_isotope_night0"])
       )
-
+      
       p_ts_gpp <- ggplot(ts_gpp, aes(x = TIMESTAMP, y = flux, color = series)) +
         geom_line(alpha = 0.8, linewidth = 0.7) +
         scale_color_manual(
@@ -2388,9 +2534,9 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
         ) +
         theme_minimal() +
         theme(legend.position = "bottom")
-
+      
       print(p_ts_gpp)
-
+      
       ggsave(
         filename = here::here("figures", "USEDN_Timeseries_GPP_Tram_NT_DT_Isotope.png"),
         plot = p_ts_gpp,
@@ -2398,15 +2544,15 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
         dpi = 300, bg = "white"
       )
     }
-
+    
     # -----------------------------
     # RECO time series
     # -----------------------------
     reco_levels <- c("Tram_RECO", "DT_RECO", "NT_RECO", "Reco_isotope")
     reco_present <- intersect(reco_levels, names(usedn_join))
-
+    
     if (length(reco_present) > 1) {
-
+      
       ts_reco <- usedn_join %>%
         pivot_longer(
           cols      = all_of(reco_present),
@@ -2414,21 +2560,21 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
           values_to = "flux"
         ) %>%
         mutate(series = factor(series, levels = reco_levels))
-
+      
       reco_labels <- c(
         "Tram_RECO"    = "ANN[BEST]",
         "DT_RECO"      = "Daytime",
         "NT_RECO"      = "Nighttime",
         "Reco_isotope" = "Isotope"
       )
-
+      
       reco_colors <- c(
         "Tram_RECO"    = unname(method_cols["Tram_RECO"]),
         "DT_RECO"      = unname(method_cols["DT_RECO"]),
         "NT_RECO"      = unname(method_cols["NT_RECO"]),
         "Reco_isotope" = unname(method_cols["Reco_isotope"])
       )
-
+      
       p_ts_reco <- ggplot(ts_reco, aes(x = TIMESTAMP, y = flux, color = series)) +
         geom_line(alpha = 0.8, linewidth = 0.7) +
         scale_color_manual(
@@ -2444,9 +2590,9 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
         ) +
         theme_minimal() +
         theme(legend.position = "bottom")
-
+      
       print(p_ts_reco)
-
+      
       ggsave(
         filename = here::here("figures", "USEDN_Timeseries_RECO_Tram_NT_DT_Isotope.png"),
         plot = p_ts_reco,
@@ -2466,6 +2612,9 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
 # -------------------------
 # 0) Prep: time-of-day
 # -------------------------
+stopifnot(exists("usedn_join"))
+if (nrow(usedn_join) == 0) stop("usedn_join is empty: check SITE label in usedn_base")
+
 usedn_join <- usedn_join %>%
   mutate(tod = hour(TIMESTAMP) + minute(TIMESTAMP) / 60)
 
@@ -2613,27 +2762,26 @@ if (length(reco_present) > 1) {
 ```
 ```{r usedn-isotope-env-diurnal, message=FALSE, warning=FALSE}
 # Diurnal mean ± SD for environmental drivers during the isotope campaign
-# at US-EDN (Aug 21 – Sep 5, 2022). Multi-panel, one variable per facet.
+# at US-EDN (Aug 21 – Sep 5, 2022, but usable data only Aug 23-Sept 3). Multi-panel, one variable per facet.
 
 # -------------------------
 # 0) Define isotope campaign window
 # -------------------------
-iso_start <- as.POSIXct("2022-08-21 00:00:00", tz = "UTC")
-iso_end   <- as.POSIXct("2022-09-05 23:59:59", tz = "UTC")
+iso_obs   <- usedn_join$TIMESTAMP[!is.na(usedn_join$Reco_isotope)]
+iso_start <- min(iso_obs); iso_end <- max(iso_obs)
 
 # -------------------------
 # 1) Filter to US-EDN during isotope period
 # -------------------------
-usedn_label <- grep("USEDN", unique(df_subset_orig$SITE), value = TRUE, ignore.case = TRUE)
+usedn_label <- grep("USEDN|US-EDN", unique(df_subset_orig$SITE),
+                    value = TRUE, ignore.case = TRUE)
 
-env_vars_iso <- c("SW_IN_RAW", "TA", "VPD", "WS", "WD_COS", "WD_SIN")
+env_vars_iso <- c("SW_IN_RAW", "TA", "VPD", "WS", "WD_COS", "WD_SIN", "WTD")
 
 usedn_iso_env <- df_subset_orig %>%
-  filter(
-    SITE %in% usedn_label,
-    TIMESTAMP >= iso_start,
-    TIMESTAMP <= iso_end
-  ) %>%
+  filter(SITE %in% usedn_label,
+         TIMESTAMP >= iso_start,
+         TIMESTAMP <= iso_end) %>%
   mutate(tod = hour(TIMESTAMP) + minute(TIMESTAMP) / 60) %>%
   select(TIMESTAMP, tod, any_of(env_vars_iso))
 
@@ -2641,37 +2789,45 @@ vars_present <- intersect(env_vars_iso, names(usedn_iso_env))
 
 diurnal_iso_env <- usedn_iso_env %>%
   select(tod, all_of(vars_present)) %>%
-  pivot_longer(
-    cols      = all_of(vars_present),
-    names_to  = "Variable",
-    values_to = "Value"
-  ) %>%
+  pivot_longer(cols = all_of(vars_present),
+               names_to = "Variable", values_to = "Value") %>%
   filter(is.finite(tod), is.finite(Value)) %>%
   group_by(Variable, tod) %>%
-  summarise(
-    mean_value = mean(Value, na.rm = TRUE),
-    sd_value   = sd(Value,   na.rm = TRUE),
-    .groups    = "drop"
-  ) %>%
-  mutate(
-    Variable = factor(
-      Variable,
-      levels = c("SW_IN_RAW", "TA", "VPD", "WS", "WD_COS", "WD_SIN")
-    )
-  )
+  summarise(mean_value = mean(Value, na.rm = TRUE),
+            sd_value   = sd(Value,   na.rm = TRUE),
+            .groups    = "drop")
 
 # -------------------------
-# Custom y-axis labeller using plotmath expressions
+# 1b) Percent of half-hours flooded, as an extra panel (no SD ribbon)
+# -------------------------
+flood_panel <- usedn_iso_env %>%
+  filter(is.finite(tod), is.finite(WTD)) %>%
+  group_by(tod) %>%
+  summarise(mean_value = 100 * mean(WTD > 0),
+            sd_value   = NA_real_,
+            .groups    = "drop") %>%
+  mutate(Variable = "PCT_FLOOD")
+
+diurnal_iso_env <- bind_rows(diurnal_iso_env, flood_panel) %>%
+  mutate(Variable = factor(
+    Variable,
+    levels = c("SW_IN_RAW", "TA", "VPD",
+               "WS", "WD_COS", "WD_SIN",
+               "WTD", "PCT_FLOOD")
+  ))
+
+# -------------------------
+# Y-axis labels (note corrected exponents)
 # -------------------------
 var_labeller <- as_labeller(
-  c(
-    "SW_IN_RAW" = "SW~radiation~(W~m^{2})",
+  c("SW_IN_RAW" = "SW~radiation~(W~m^{-2})",
     "TA"        = "Air~temperature~(degree*C)",
     "VPD"       = "VPD~(hPa)",
-    "WS"        = "Wind~speed~(m~s^{1})",
+    "WS"        = "Wind~speed~(m~s^{-1})",
     "WD_COS"    = "Wind~direction~(cos)",
-    "WD_SIN"    = "Wind~direction~(sin)"
-  ),
+    "WD_SIN"    = "Wind~direction~(sin)",
+    "WTD"       = "WTD~(m)",
+    "PCT_FLOOD" = "Flooded~('%'~of~half*-hours)"),
   default = label_parsed
 )
 
@@ -2679,53 +2835,75 @@ var_labeller <- as_labeller(
 # 2) Plot
 # -------------------------
 p_iso_env <- ggplot(diurnal_iso_env, aes(x = tod, y = mean_value)) +
-  geom_ribbon(
-    aes(ymin = mean_value - sd_value, ymax = mean_value + sd_value),
-    fill  = "grey70",
-    alpha = 0.4,
-    color = NA
-  ) +
+  geom_ribbon(aes(ymin = mean_value - sd_value, ymax = mean_value + sd_value),
+              fill = "grey70", alpha = 0.4, color = NA, na.rm = TRUE) +
   geom_line(linewidth = 0.8, color = "black") +
-  geom_vline(
-    xintercept = c(6, 18),
-    linetype   = "dashed",
-    color      = "grey40",
-    linewidth  = 0.4
-  ) +
-  facet_wrap(
-    ~ Variable,
-    scales   = "free_y",
-    ncol     = 3,
-    labeller = var_labeller,
-    strip.position = "left"   # move strip to left as y-axis label
-  ) +
-  scale_x_continuous(
-    breaks = seq(0, 24, by = 6),
-    limits = c(0, 24)
-  ) +
-  labs(
-    title = NULL,
-    x     = "Hour of day",
-    y     = NULL
-  ) +
+  geom_vline(xintercept = c(6, 18), linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 3,
+             labeller = var_labeller, strip.position = "left") +
+  scale_x_continuous(breaks = seq(0, 24, by = 6), limits = c(0, 24)) +
+  labs(title = NULL, x = "Hour of day", y = NULL) +
   theme_minimal(base_size = 11) +
-  theme(
-    panel.grid.minor  = element_blank(),
-    strip.text.y.left = element_text(size = 10, angle = 90),
-    strip.placement   = "outside",   # place strip outside plot area
-    axis.title.y      = element_blank()
-  )
+  theme(panel.grid.minor  = element_blank(),
+        strip.text.y.left = element_text(size = 10, angle = 90),
+        strip.placement   = "outside",
+        axis.title.y      = element_blank())
 
 print(p_iso_env)
 
-ggsave(
-  filename = here::here("figures", "USEDN_Isotope_Period_Diurnal_EnvDrivers.png"),
-  plot     = p_iso_env,
-  width    = 10,
-  height   = 7,
-  dpi      = 300,
-  bg       = "white"
-)
+ggsave(here::here("figures", "USEDN_Isotope_Period_Diurnal_EnvDrivers.png"),
+       p_iso_env, width = 10, height = 9, dpi = 300, bg = "white")
+
+# Hour of day at which each driver peaks (for the midday depression argument)
+peak_tod <- diurnal_iso_env %>%
+  group_by(Variable) %>%
+  slice_max(mean_value, n = 1) %>%
+  select(Variable, peak_tod = tod, peak_value = mean_value)
+
+peak_tod
+
+usedn_iso_wtd <- df_subset_orig %>%
+  filter(SITE %in% usedn_label, TIMESTAMP >= iso_start, TIMESTAMP <= iso_end) %>%
+  mutate(tod  = hour(TIMESTAMP) + minute(TIMESTAMP) / 60,
+         date = as.Date(TIMESTAMP)) %>%
+  select(TIMESTAMP, date, tod, WTD) %>%
+  filter(is.finite(WTD))
+
+# Time of daily WTD maximum, by day: does high tide sweep across clock hours?
+high_tide_tod <- usedn_iso_wtd %>%
+  group_by(date) %>%
+  slice_max(WTD, n = 1) %>%
+  ungroup() %>%
+  select(date, tod, WTD)
+
+high_tide_tod
+
+# --- Inundation by hour of day during the isotope campaign (US-EDN) ---
+usedn_iso_wtd <- df_subset_orig %>%
+  filter(SITE %in% usedn_label, TIMESTAMP >= iso_start, TIMESTAMP <= iso_end) %>%
+  mutate(tod  = hour(TIMESTAMP) + minute(TIMESTAMP) / 60,
+         hour = floor(tod)) %>%
+  filter(is.finite(WTD))
+
+flood_by_hour <- usedn_iso_wtd %>%
+  group_by(hour) %>%
+  summarise(n           = n(),
+            pct_flooded = 100 * mean(WTD > 0),
+            mean_WTD    = mean(WTD),
+            sd_WTD      = sd(WTD),
+            .groups     = "drop")
+
+flood_by_hour <- usedn_iso_wtd %>%
+  mutate(hour = floor(tod)) %>%
+  group_by(hour) %>%
+  summarise(n = n(),
+            pct_flooded = 100 * mean(WTD > 0),
+            mean_WTD = mean(WTD),
+            .groups = "drop")
+
+flood_by_hour
+
 ```
 
 
@@ -2762,4 +2940,22 @@ results <- list(
 
 comparison_stats <- bind_rows(results, .id = "model")
 comparison_stats
+
+# --- Isotope data coverage during the campaign ---
+
+iso_coverage <- usedn_join %>%
+  mutate(
+    daytime = if ("SW_IN_RAW" %in% names(.)) SW_IN_RAW > 10 else tod >= 6 & tod < 18
+  ) %>%
+  summarise(
+    n_iso_reco       = sum(!is.na(Reco_isotope)),
+    n_iso_reco_day   = sum(!is.na(Reco_isotope) & daytime),
+    n_iso_reco_night = sum(!is.na(Reco_isotope) & !daytime),
+    n_possible       = as.numeric(difftime(iso_end, iso_start, units = "hours")) * 2,
+    pct_campaign     = 100 * n_iso_reco / n_possible,
+    first_obs        = min(TIMESTAMP[!is.na(Reco_isotope)]),
+    last_obs         = max(TIMESTAMP[!is.na(Reco_isotope)])
+  )
+
+iso_coverage
 ```
