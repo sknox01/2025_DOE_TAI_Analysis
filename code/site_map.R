@@ -1,19 +1,30 @@
-# plot_sites_north_america_zoom_distinguishable_largefont_coords.R
-# Map site locations (25°N–55°N, -140°–-50°) with readable labels, separation for nearby points,
-# larger text, and visible lat/long coordinates.
+# Figure_1_site_map.R
+# Figure 1: map of the eight tidal marsh study sites (25°N–55°N, 140°W–50°W),
+# formatted to Global Change Biology figure requirements:
+#   * >= 300 dpi, PNG
+#   * no title or figure number on the figure, and no white border
+#   * saved at its final printed size, so font sizes are true point sizes
+#   * single panel, so no panel letters are needed
+# Caption (in the manuscript) must include: "Map lines delineate study areas and do not
+# necessarily depict accepted national boundaries."
 
 # ---- Packages ----
 required_packages <- c("readxl", "dplyr", "ggplot2", "sf",
-                       "rnaturalearth", "rnaturalearthdata", "ggrepel")
+                       "rnaturalearth", "rnaturalearthdata", "ggrepel", "here")
 for (pkg in required_packages) {
   if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
   library(pkg, character.only = TRUE)
 }
 
+# ---- GCB figure settings (same as the main analysis script) ----
+gcb_dpi  <- 300
+gcb_full <- 180   # mm, full page width (check Wiley's current figure-size guidance)
+gcb_base <- 8     # base font size (pt) at printed size
+
 # ---- User settings ----
-excel_path <- "data/Site characteristics.xlsx"  # adjust if needed
-lat_col <- "Latitude"
-lon_col <- "Longitude"
+excel_path <- here::here("data", "Site characteristics final.xlsx")  # the analysis script reads "Site characteristics final.xlsx"; use the same file if coordinates differ
+lat_col  <- "Latitude"
+lon_col  <- "Longitude"
 name_col <- "Site_ID"
 
 # Jitter (in degrees). ~0.1° ≈ 10–11 km latitude near mid-latitudes
@@ -85,6 +96,7 @@ deg_lbl <- function(x, hemi_pos = c("E","N"), hemi_neg = c("W","S"), axis = "x")
 }
 
 # ---- Plot ----
+# Point and label sizes are scaled for the printed figure (ggplot sizes are in mm; .pt converts from pt)
 p <- ggplot() +
   geom_sf(data = na, fill = "grey80", color = "white", linewidth = 0.2) +
   
@@ -92,22 +104,23 @@ p <- ggplot() +
   geom_point(
     data = sites,
     aes(x = lon_plot, y = lat_plot),
-    size = 4.5, color = "white"
+    size = 2.4, color = "white"
   ) +
   # Foreground points
   geom_point(
     data = sites,
     aes(x = lon_plot, y = lat_plot),
-    size = 3, color = "royalblue1"
+    size = 1.6, color = "royalblue1"
   ) +
   
   # Repelled labels using the jittered/offset coordinates
   ggrepel::geom_text_repel(
     data = sites,
     aes(x = lon_plot, y = lat_plot, label = site_id),
-    size = 5,
-    box.padding = 0.4,
-    point.padding = 0.3,
+    size = gcb_base / ggplot2::.pt,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    segment.size = 0.3,
     min.segment.length = 0,
     max.overlaps = Inf,
     seed = 42
@@ -122,18 +135,25 @@ p <- ggplot() +
     breaks = seq(ylim[1], ylim[2], by = 5),
     labels = function(y) deg_lbl(y, axis = "y")
   ) +
-  theme_minimal(base_size = 20) +
-  labs(
-    x = "", y = ""
-  ) +
+  labs(title = NULL, x = NULL, y = NULL) +   # no title or figure number on the figure
+  theme_minimal(base_size = gcb_base) +
   theme(
-    plot.title = element_text(size = 26, face = "bold"),
-    plot.subtitle = element_text(size = 18),
-    axis.text = element_text(size = 16, color = "black"),
-    axis.title = element_text(size = 18, face = "bold"),
-    panel.grid.major = element_line(linewidth = 0.3, linetype = "dotted", color = "grey70")
+    axis.text        = element_text(size = gcb_base - 1, color = "black"),
+    panel.grid.major = element_line(linewidth = 0.2, linetype = "dotted", color = "grey70"),
+    plot.background  = element_rect(fill = "white", color = NA),
+    plot.margin      = margin(2, 4, 2, 2)    # minimal margin: no white border
   )
 
-# ---- Save & show ----
-ggsave("figures/site_map.png", p, width = 12, height = 9, dpi = 300)
+# ---- Save at printed size ----
+# Height follows the map's aspect ratio (geographic coordinates: 1 / cos(mid-latitude)),
+# so there is no empty band above or below the map.
+axis_space_mm <- 10
+panel_w <- gcb_full - axis_space_mm
+panel_h <- panel_w * diff(ylim) / diff(xlim) / cos(mean(ylim) * pi / 180)
+map_h   <- panel_h + axis_space_mm
+
+dir.create(here::here("figures"), showWarnings = FALSE)
+ggsave(here::here("figures", "Figure_1.png"), p,
+       width = gcb_full, height = map_h, units = "mm",
+       dpi = gcb_dpi, bg = "white")
 print(p)

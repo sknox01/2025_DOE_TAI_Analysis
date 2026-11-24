@@ -11,7 +11,7 @@ output:
 
 ```{r setup, message=FALSE, warning=FALSE}
 
-# Note chatGPT was used to help streamline some of the code below.
+# Note ChatGPT & Claude (Anthropic) were used to help streamline some of the code below.
 
 suppressPackageStartupMessages({
   library(tidyverse)
@@ -48,6 +48,50 @@ base_dir <- "/Users/saraknox/Code/nee-partition" # this is the directory for the
 #base_dir <- "C:/Users/Eddie/Documents/GitHub/nee-partition-main"
 pred_dir <- file.path(base_dir, "model_predictions")
 data_dir <- file.path(base_dir, "data")
+
+# --- Figure numbering for GCB submission ---
+# Edit here if the figure order changes; every saved manuscript figure uses this table.
+# Not produced by this script: Figure 1 (site map), Figure S3 (Keeling plot),
+# Figure S4 (LGR vs LI-7500 flux comparison).
+fig_names <- c(
+  nighttime_scatter   = "Figure_2",   # Nighttime NEE vs modeled RECO, by site
+  diurnal_reco_summer = "Figure_3",   # Summer diurnal RECO, all sites
+  usedn_diurnal_reco  = "Figure_4",   # US-EDN diurnal RECO incl. isotope
+  diurnal_gpp_summer  = "Figure_5",   # Summer diurnal GPP, all sites
+  nee_violin          = "Figure_S1",  # NEE distribution by site
+  salinity_timeseries = "Figure_S2",  # Salinity time series by site
+  sitechar_perf       = "Figure_S5",  # Site characteristics vs performance
+  usedn_reco_ts       = "Figure_S6",  # US-EDN RECO time series incl. isotope
+  corr_matrix         = "Figure_S7",  # Spearman correlation matrices by site
+  diurnal_sal_summer  = "Figure_S8",  # Summer diurnal salinity by site
+  usedn_iso_env       = "Figure_S9"   # US-EDN drivers during isotope campaign
+)
+fig_file <- function(key) here::here("figures", paste0(fig_names[[key]], ".png"))
+
+# --- GCB figure requirements (applied to every manuscript and SI figure) ---
+# * >= 300 dpi; no figure number or title on the figure; no white border
+# * multi-panel figures: panels labelled with bold lower-case letters in parentheses, (a), (b), ...
+# * SI or SI-derived units
+# Figures are saved at their final printed size, so the font sizes below are true point sizes.
+# 180 mm is used as the full page width; check Wiley's current figure-size guidance.
+gcb_dpi  <- 300
+gcb_full <- 180   # mm, full page width
+gcb_mid  <- 120   # mm, 1.5-column width
+gcb_base <- 8     # base font size (pt) at printed size
+
+# Facet labeller that adds bold panel letters, e.g. "(a) CA-DSM"; blank padding facets stay empty
+panel_tags <- function(lv) {
+  keep <- !grepl("^pad", lv)
+  out  <- rep('""', length(lv))
+  out[keep] <- sprintf('bold("(%s)")~~"%s"', letters[seq_len(sum(keep))], lv[keep])
+  stats::setNames(out, lv)
+}
+panel_labeller <- function(lv) ggplot2::as_labeller(panel_tags(lv), ggplot2::label_parsed)
+
+# Salinity is practical salinity (PSS-78), which is dimensionless, so no unit is shown.
+# State the scale once in Materials and Methods and in the relevant captions.
+sal_lab     <- "Salinity"
+sal_iqr_lab <- "Salinity IQR"
 
 # --- Helpers ---
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
@@ -397,15 +441,15 @@ safe_fit <- fit_stats
 slope_ci_block <- function(df, n_boot = 1000, seed = 42) {
   if (nrow(df) < 3 || !"TIMESTAMP" %in% names(df))
     return(tibble(slope_lo = NA_real_, slope_hi = NA_real_, n_days = NA_integer_))
-
+  
   d <- df %>%
     filter(is.finite(Reco), is.finite(NEE_RAW)) %>%
     mutate(day = as.Date(TIMESTAMP))
-
+  
   days <- unique(d$day)
   if (length(days) < 10)
     return(tibble(slope_lo = NA_real_, slope_hi = NA_real_, n_days = length(days)))
-
+  
   set.seed(seed)
   slopes <- replicate(n_boot, {
     samp <- tibble(day = sample(days, length(days), replace = TRUE)) %>%
@@ -413,7 +457,7 @@ slope_ci_block <- function(df, n_boot = 1000, seed = 42) {
     if (var(samp$Reco, na.rm = TRUE) == 0) return(NA_real_)
     unname(coef(lm(NEE_RAW ~ Reco, data = samp))[2])
   })
-
+  
   q <- quantile(slopes, c(0.025, 0.975), na.rm = TRUE)
   tibble(slope_lo = unname(q[1]), slope_hi = unname(q[2]), n_days = length(days))
 }
@@ -559,8 +603,8 @@ p_best <- ggplot(plot_data_best, aes(x = Reco, y = NEE_RAW)) +
   labs(
     title = NULL,
     color = NULL,
-    x = expression("Modeled RECO"["night"]~(mu*mol~m^{-2}~s^{-1})),
-    y = expression("Measured NEE"["night"]~(mu*mol~m^{-2}~s^{-1})),
+    x = expression("Modeled RECO"["night"]~(mu*mol~CO[2]~m^{-2}~s^{-1})),
+    y = expression("Measured NEE"["night"]~(mu*mol~CO[2]~m^{-2}~s^{-1})),
     color = "Series"
   ) +
   theme_classic() +
@@ -578,7 +622,7 @@ ggsave(
 plot_data_best <- left_join(plot_base_best, model_results_best,
                             by = c('SITE','series')) %>%
   mutate(series = factor(series,
-    levels = c("Tramontana_bestmodel_RECO", "DT_RECO", "NT_RECO")))
+                         levels = c("Tramontana_bestmodel_RECO", "DT_RECO", "NT_RECO")))
 
 series_cols <- c(
   "Tramontana_bestmodel_RECO" = "#1f77b4",
@@ -596,7 +640,8 @@ p_best <- ggplot(plot_data_best, aes(x = Reco, y = NEE_RAW, color = series)) +
   geom_point(alpha = 0.2, size = 0.6) +
   geom_smooth(method = "lm", se = FALSE, linewidth = 0.9) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
-  facet_wrap(~ SITE, ncol = 4, scales = "free") +
+  facet_wrap(~ SITE, ncol = 4, scales = "free",
+             labeller = panel_labeller(sort(unique(plot_data_best$SITE)))) +
   scale_color_manual(values = series_cols, labels = series_labs,
                      breaks = names(series_cols)) +
   guides(color = guide_legend(override.aes = list(alpha = 1, size = 2),
@@ -604,14 +649,14 @@ p_best <- ggplot(plot_data_best, aes(x = Reco, y = NEE_RAW, color = series)) +
   labs(
     title = NULL,
     color = NULL,
-    x = expression("Modeled RECO"["night"]~(mu*mol~m^{-2}~s^{-1})),
-    y = expression("Measured NEE"["night"]~(mu*mol~m^{-2}~s^{-1}))
+    x = expression("Modeled RECO"["night"]~(mu*mol~CO[2]~m^{-2}~s^{-1})),
+    y = expression("Measured NEE"["night"]~(mu*mol~CO[2]~m^{-2}~s^{-1}))
   ) +
-  theme_classic() +
+  theme_classic(base_size = gcb_base) +
   theme(legend.position = "bottom")
 
-ggsave(here::here("figures", "Nighttime_NEE_vs_Reco_bySite_BEST_by_colour.png"),
-       p_best, width = 12, height = 7, dpi = 300, bg = "white")
+ggsave(fig_file("nighttime_scatter"),
+       p_best, width = gcb_full, height = 115, units = "mm", dpi = gcb_dpi, bg = "white")
 
 
 readr::write_csv(
@@ -876,7 +921,7 @@ dtnt_diurnal <- if (length(present_cols) > 0) {
     pivot_longer(cols = all_of(present_cols), names_to = "series", values_to = "flux_value") %>%
     mutate(
       flux_class = if_else(grepl("GPP$", series), "GPP", "RECO"),
-      flux_value = if_else(flux_class == "GPP", -flux_value, flux_value)    # plot GPP as positive uptake
+      flux_value = if_else(flux_class == "GPP", -flux_value, flux_value)    # REddyProc GPP is positive; multiply by -1 so GPP is negative (uptake)
     )
 } else {
   tibble(
@@ -904,7 +949,7 @@ best_tram_g <- if ("bestmodel_GPP" %in% names(df_ss)) {
     transmute(
       SITE, season, tod,
       series = "Tramontana_bestmodel_GPP",
-      flux_value = -bestmodel_GPP,
+      flux_value = -bestmodel_GPP,   # ANN GPP is positive; multiply by -1 so GPP is negative (uptake)
       flux_class = "GPP"
     )
 } else tibble(SITE=character(), season=character(), tod=double(), series=character(), flux_value=double(), flux_class=character())
@@ -1182,22 +1227,23 @@ make_ts_plot <- function(value_col, outfile, ylab) {
   
   p <- ggplot(d, aes(x = TIMESTAMP, y = value, group = seg_id)) +
     geom_line(alpha = 0.8, linewidth = 0.4) +
-    facet_wrap(~ SITE_LABEL, nrow = 2, scales = "free") +
-    labs(title = NULL, x = "Time", y = ylab) +
-    theme_minimal() +
+    facet_wrap(~ SITE_LABEL, nrow = 2, scales = "free",
+               labeller = panel_labeller(sort(unique(d$SITE_LABEL)))) +
+    labs(title = NULL, x = "Date", y = ylab) +
+    theme_minimal(base_size = gcb_base) +
     theme(panel.grid.minor = element_blank())
   
   ggsave(
     filename = here::here("figures", outfile),
     plot = p,
-    width = 10, height = 8,
-    dpi   = 300, bg = "white"
+    width = gcb_full, height = 140, units = "mm",
+    dpi   = gcb_dpi, bg = "white"
   )
 }
 
 ts_specs <- list(
   WTD      = list(col = "WTD",      ylab = "WTD (m)"),
-  Salinity = list(col = "Salinity", ylab = "Salinity (ppt)"),
+  Salinity = list(col = "Salinity", ylab = sal_lab),
   TA       = list(col = "TA",       ylab = "Air temperature (°C)"),
   NEE      = list(col = "NEE_RAW",  ylab = expression(NEE~(mu*mol~CO[2]~m^-2~s^-1)))
 )
@@ -1205,7 +1251,8 @@ ts_specs <- list(
 for (nm in names(ts_specs)) {
   spec <- ts_specs[[nm]]
   if (spec$col %in% names(df_subset)) {
-    outfile <- paste0("Timeseries_", nm, "_bySite.png")
+    outfile <- if (nm == "Salinity") paste0(fig_names[["salinity_timeseries"]], ".png") else
+      paste0("Timeseries_", nm, "_bySite.png")
     make_ts_plot(spec$col, outfile, spec$ylab)
   }
 }
@@ -1289,7 +1336,7 @@ pNEE <- ggplot(df_subset, aes(x = SITE, y = NEE_RAW)) +
     color = "black"
   ) +
   
-  # Median (horizontal line)
+  # Median (red triangle)
   stat_summary(
     fun = median,
     geom = "point",
@@ -1298,7 +1345,7 @@ pNEE <- ggplot(df_subset, aes(x = SITE, y = NEE_RAW)) +
     fill = "red"
   ) +
   
-  # Mean (point)
+  # Mean (white triangle)
   stat_summary(
     fun = mean,
     geom = "point",
@@ -1307,10 +1354,10 @@ pNEE <- ggplot(df_subset, aes(x = SITE, y = NEE_RAW)) +
     fill = "white"
   ) +
   
-  theme_bw(base_size = 11) +
+  theme_bw(base_size = gcb_base) +
   labs(
     x = '',
-    y = expression(NEE~(mu*mol~m^{-2}~s^{-1}))
+    y = expression(NEE~(mu*mol~CO[2]~m^{-2}~s^{-1}))
   ) +
   theme(
     axis.text.x = element_text(angle = 45, hjust = 1),
@@ -1320,12 +1367,13 @@ pNEE <- ggplot(df_subset, aes(x = SITE, y = NEE_RAW)) +
   )
 
 ggsave(
-  filename = here::here("figures", "NEE_violin_by_site.png"),
+  filename = fig_file("nee_violin"),
   plot     = pNEE,
-  width    = 8,
-  height   = 5,
-  units    = "in",
-  dpi      = 300
+  width    = gcb_mid,
+  height   = 80,
+  units    = "mm",
+  dpi      = gcb_dpi,
+  bg       = "white"
 )
 
 spec_by_site <- df_subset_orig %>%
@@ -1365,8 +1413,8 @@ tibble(period_h = 1 / ls$scanned, power = ls$power) %>%
 ## Correlations between predictors
 
 ```{r correlation-matrix-by-site, message=FALSE, warning=FALSE}
-# Correlation matrix with significance testing, upper triangle, hierarchical
-# clustering, per site. Uses Spearman (non-parametric) correlation.
+# Correlation matrix with significance testing, upper triangle, fixed variable
+# order (same for all sites), per site. Uses Spearman (non-parametric) correlation.
 # Significant correlations (p < 0.05) are shown; non-significant are crossed out.
 
 # -------------------------
@@ -1390,7 +1438,8 @@ sites <- sort(unique(df_subset$SITE))
 # -------------------------
 # Helper function to avoid duplicating corrplot call
 # -------------------------
-plot_one_site <- function(site) {
+plot_one_site <- function(site, tag = NULL) {
+  main_title <- if (is.null(tag)) site else paste0("(", tag, ") ", site)  # bold panel letter (title font is bold)
   d <- df_subset %>%
     filter(SITE == site) %>%
     dplyr::select(any_of(cor_vars)) %>%
@@ -1398,7 +1447,7 @@ plot_one_site <- function(site) {
   
   vars_present <- intersect(cor_vars, names(d))
   if (length(vars_present) < 3 || nrow(d) < 10) {
-    plot.new(); title(main = site, cex.main = 1.4); return(invisible(NULL))
+    plot.new(); title(main = main_title, cex.main = 1.1); return(invisible(NULL))
   }
   
   d <- d[, vars_present, drop = FALSE]
@@ -1415,20 +1464,20 @@ plot_one_site <- function(site) {
     order       = "original",   # <-- changed from "hclust"
     tl.col      = "black",
     tl.srt      = 45,
-    tl.cex      = 0.9,
+    tl.cex      = 1,
     method      = "color",
     col         = colorRampPalette(c("#d73027", "white", "#4575b4"))(200),
     addCoef.col = "black",
-    number.cex  = 0.7,
+    number.cex  = 0.85,
     p.mat       = p_mat,
     sig.level   = 0.05,
     insig       = "pch",
     pch         = 4,
     pch.cex     = 1.5,
     pch.col     = "purple",
-    cl.cex      = 0.8,
+    cl.cex      = 0.9,
     mar         = c(0, 0, 3, 0),
-    title       = site,
+    title       = main_title,
     cex.main    = 1.1
   )
 }
@@ -1437,16 +1486,17 @@ plot_one_site <- function(site) {
 # Save to file — larger canvas to accommodate bigger text
 # -------------------------
 png(
-  filename = here::here("figures", "Correlation_Matrix_Spearman_bySite.png"),
-  width    = 14,
-  height   = 8,
-  units    = "in",
-  res      = 150,    # key change — lower dpi makes text larger relative to canvas
-  bg       = "white"
+  filename  = fig_file("corr_matrix"),
+  width     = gcb_full,
+  height    = 240,
+  units     = "mm",
+  res       = gcb_dpi,
+  pointsize = gcb_base,   # printed size, so text is at true point size
+  bg        = "white"
 )
 
-par(mfrow = c(2, 4), mar = c(1, 1, 4, 1), oma = c(0, 0, 3, 0))  # no cex here
-for (site in sites) plot_one_site(site)
+par(mfrow = c(4, 2), mar = c(1, 1, 3, 1), oma = c(0, 0, 0, 0))  # 4 x 2 layout fits the page; no empty border
+for (i in seq_along(sites)) plot_one_site(sites[i], letters[i])
 #mtext(
 #  "Spearman correlation (X = non-significant, p ≥ 0.05)",
 #  outer = TRUE, cex = 1.2, line = 0.8
@@ -1457,7 +1507,7 @@ dev.off()
 # Print to screen
 # -------------------------
 par(mfrow = c(2, 4), mar = c(1, 1, 4, 1), oma = c(0, 0, 3, 0))
-for (site in sites) plot_one_site(site)
+for (i in seq_along(sites)) plot_one_site(sites[i], letters[i])
 mtext(
   "Spearman correlation (X = non-significant, p ≥ 0.05)",
   outer = TRUE, cex = 1.4, line = 0.8
@@ -1668,9 +1718,9 @@ if (exists("diurnal_stats") && nrow(diurnal_stats) > 0) {
     
     # y-axis label depends on flux_target
     y_lab <- if (flux_target == "GPP") {
-      expression(GPP~(mu*mol~m^{-2}~s^{-1}))
+      expression(GPP~(mu*mol~CO[2]~m^{-2}~s^{-1}))
     } else {
-      expression(RECO~(mu*mol~m^{-2}~s^{-1}))
+      expression(RECO~(mu*mol~CO[2]~m^{-2}~s^{-1}))
     }
     
     p <- ggplot(d, aes(x = tod, y = mean_flux, color = series, fill = series)) +
@@ -1688,7 +1738,7 @@ if (exists("diurnal_stats") && nrow(diurnal_stats) > 0) {
         ncol = ncol,
         scales = "free_y",
         drop = FALSE,
-        labeller = labeller(SITE_LABEL_F = lab_map)
+        labeller = panel_labeller(levels_all)
       ) +
       scale_x_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
       
@@ -1712,19 +1762,19 @@ if (exists("diurnal_stats") && nrow(diurnal_stats) > 0) {
         fill  = NULL    # remove legend title
       ) +
       
-      theme_minimal() +
+      theme_minimal(base_size = gcb_base) +
       theme(
         legend.position = "bottom",
-        panel.grid.minor = element_blank(),
-        strip.text = element_text(size = 8)
+        panel.grid.minor = element_blank()
       )
     
     ggsave(
       filename = here::here("figures", outfile),
       plot = p,
-      width = 12,
-      height = 7,
-      dpi = 300,
+      width = gcb_full,
+      height = 115,
+      units = "mm",
+      dpi = gcb_dpi,
       bg = "white"
     )
   }
@@ -1739,11 +1789,11 @@ if (exists("diurnal_stats") && nrow(diurnal_stats) > 0) {
                     c("Tramontana_bestmodel_RECO", "NT_RECO", "DT_RECO"))
   
   make_diurnal_plot("GPP",  "Summer",
-                    "Diurnal_GPP_AllSites_Summer.png",
+                    paste0(fig_names[["diurnal_gpp_summer"]], ".png"),
                     c("Tramontana_bestmodel_GPP", "NT_GPP", "DT_GPP"))
   
   make_diurnal_plot("RECO", "Summer",
-                    "Diurnal_RECO_AllSites_Summer.png",
+                    paste0(fig_names[["diurnal_reco_summer"]], ".png"),
                     c("Tramontana_bestmodel_RECO", "NT_RECO", "DT_RECO"))
 }
 ```
@@ -1790,7 +1840,7 @@ reco_long <- df_ss %>%
 gpp_long <- df_ss %>%
   select(SITE, tod, flood_state, all_of(present_gpp)) %>%
   pivot_longer(cols = all_of(present_gpp), names_to = "series", values_to = "flux_value") %>%
-  mutate(flux_class = "GPP", flux_value = -flux_value)  # plot GPP as positive uptake
+  mutate(flux_class = "GPP", flux_value = -flux_value)  # REddyProc GPP is positive; multiply by -1 so GPP is negative (uptake)
 
 best_reco_long <- if (has_best_reco) {
   df_ss %>%
@@ -1807,7 +1857,7 @@ best_gpp_long <- if (has_best_gpp) {
     transmute(
       SITE, tod, flood_state,
       series = "Tramontana_bestmodel_GPP",
-      flux_value = -bestmodel_GPP,
+      flux_value = -bestmodel_GPP,   # ANN GPP is positive; multiply by -1 so GPP is negative (uptake)
       flux_class = "GPP"
     )
 } else tibble()
@@ -1925,14 +1975,14 @@ make_flux_flood_figure <- function(flux_target, outfile, y_lab_expr) {
 p_reco_summer <- make_flux_flood_figure(
   flux_target = "RECO",
   outfile     = "Diurnal_RECO_Summer_Flooded_vs_NotFlooded_bySite.png",
-  y_lab_expr  = expression(RECO~(mu*mol~m^{-2}~s^{-1}))
+  y_lab_expr  = expression(RECO~(mu*mol~CO[2]~m^{-2}~s^{-1}))
 )
 
 # Summer GPP
 p_gpp_summer <- make_flux_flood_figure(
   flux_target = "GPP",
   outfile     = "Diurnal_GPP_Summer_Flooded_vs_NotFlooded_bySite.png",
-  y_lab_expr  = expression(GPP~(mu*mol~m^{-2}~s^{-1}))
+  y_lab_expr  = expression(GPP~(mu*mol~CO[2]~m^{-2}~s^{-1}))
 )
 ```
 
@@ -2204,24 +2254,24 @@ panel_pred_vs_metric <- function(df_all,
       aes(x = x_min, xend = x_max, y = y_min, yend = y_max, color = series),
       linewidth = 1, inherit.aes = FALSE
     ) +
-    geom_point(size = 2.6, alpha = 0.9) +
+    geom_point(size = 1.8, alpha = 0.9) +
     geom_text(
       data = annot_df, aes(x = -Inf, y = Inf, label = label),
       parse = TRUE, inherit.aes = FALSE,
-      hjust = -0.08, vjust = 1.4, size = 3.2, color = "grey20"
+      hjust = -0.08, vjust = 1.4, size = (gcb_base - 1) / ggplot2::.pt, color = "grey20"
     ) +
     facet_wrap(~ series, nrow = 1, scales = facet_scales,
                labeller = labeller(series = as_labeller(series_strip, label_parsed))) +
     scale_color_manual(values = series_palette, labels = series_labels, drop = FALSE) +
     labs(x = predictor_x_lab, y = metric_y_lab, color = NULL) +
-    theme_bw(base_size = 12) +
+    theme_bw(base_size = gcb_base) +
     theme(
       legend.position  = "none",
       panel.grid.minor = element_blank(),
       panel.grid.major = element_line(color = "grey92"),
       strip.background = element_rect(fill = "grey95", color = NA),
-      strip.text       = if (show_strip) element_text(face = "bold", size = 11) else element_blank(),
-      axis.title       = element_text(size = 12),
+      strip.text       = if (show_strip) element_text(face = "bold", size = gcb_base) else element_blank(),
+      axis.title       = element_text(size = gcb_base),
       plot.margin      = margin(4, 10, 4, 6)
     )
 }
@@ -2241,20 +2291,20 @@ p_slope <- panel_pred_vs_metric(
 
 p_rmse <- panel_pred_vs_metric(
   df_all, results, predictor_var = "Salinity_iqr", metric = "rmse",
-  predictor_x_lab = "Salinity IQR (ppt)",
+  predictor_x_lab = sal_iqr_lab,
   metric_y_lab = expression(RMSE~(mu*mol~CO[2]~m^{-2}~s^{-1})),
   show_strip = FALSE
 )
 
 # ---- Combine into one figure (R2 on top, then slope, then RMSE) ----
 combined_metrics <- p_r2 / p_slope / p_rmse +
-  plot_annotation(tag_levels = "a", tag_suffix = ")") &
-  theme(plot.tag = element_text(face = "bold", size = 12))
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(plot.tag = element_text(face = "bold", size = gcb_base + 1))
 
 ggsave(
-  filename = here::here("figures", "SiteChar_vs_Performance_R2_Slope_RMSE.png"),
+  filename = fig_file("sitechar_perf"),
   plot = combined_metrics,
-  width = 11, height = 10, dpi = 300, bg = "white"
+  width = gcb_full, height = 165, units = "mm", dpi = gcb_dpi, bg = "white"
 )
 
 print(combined_metrics)
@@ -2263,7 +2313,7 @@ print(combined_metrics)
 
 ## diurnal-wtd-salinity-ta-env
 ```{r diurnal-wtd-salinity-ta-env, message=FALSE, warning=FALSE}
-# Diurnal (hour-of-day) mean ± SD for WTD (m), Salinity (ppt), and TA (C)
+# Diurnal (hour-of-day) mean ± SD for WTD (m), Salinity (PSS-78, unitless), and TA (°C)
 # Facetted by SITE (2 rows: up to 4 sites per row), one PNG per variable.
 # Uses df_ss, which was already constructed earlier for the flux diurnal stats.
 
@@ -2316,7 +2366,7 @@ if (exists("df_ss")) {
       # Units + mean ± SD information for y-axis label
       y_lab <- dplyr::case_when(
         v == "WTD"      ~ "WTD (m)",
-        v == "Salinity" ~ "Salinity (ppt)",
+        v == "Salinity" ~ "Salinity",
         v == "TA"       ~ "Air temperature (°C)",
         TRUE            ~ "Mean ± SD"
       )
@@ -2377,11 +2427,11 @@ if (exists("df_ss")) {
         
         if (nrow(p_dat) == 0) next
         
-        y_lab <- dplyr::case_when(
-          v == "WTD"      ~ "WTD (m)",
-          v == "Salinity" ~ "Salinity (ppt)",
-          v == "TA"       ~ "Air temperature (°C)",
-          TRUE            ~ paste0(sea, " mean ± SD")
+        y_lab <- switch(v,
+                        WTD      = "WTD (m)",
+                        Salinity = sal_lab,
+                        TA       = "Air temperature (°C)",
+                        paste0(sea, " mean ± SD")
         )
         
         p_env <- ggplot(p_dat, aes(x = tod, y = mean_value)) +
@@ -2392,23 +2442,26 @@ if (exists("df_ss")) {
           geom_vline(xintercept = c(6, 18), linetype = "dashed", color = "grey40") +
           scale_x_continuous(breaks = seq(0, 24, by = 6),
                              limits = c(0, 24)) +
-          facet_wrap(~ SITE_LABEL, scales = "free_y", nrow = 2) +
+          facet_wrap(~ SITE_LABEL, scales = "free_y", nrow = 2,
+                     labeller = panel_labeller(sort(unique(p_dat$SITE_LABEL)))) +
           labs(
             title = NULL,
             x     = "Hour of day",
             y     = y_lab
           ) +
-          theme_minimal()
+          theme_minimal(base_size = gcb_base)
         
         print(p_env)
         
-        outfile <- paste0(
-          "Diurnal_", gsub(" ", "_", v), "_", sea, "_bySite.png"
-        )
+        outfile <- if (v == "Salinity" && sea == "Summer") {
+          paste0(fig_names[["diurnal_sal_summer"]], ".png")
+        } else {
+          paste0("Diurnal_", gsub(" ", "_", v), "_", sea, "_bySite.png")
+        }
         ggsave(filename = here::here("figures", outfile),
                plot  = p_env,
-               width = 10, height = 8,
-               dpi   = 300, bg = "white")
+               width = gcb_full, height = 140, units = "mm",
+               dpi   = gcb_dpi, bg = "white")
       }
     }
     
@@ -2486,7 +2539,7 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
   if (nrow(usedn_join) > 0) {
     
     # -----------------------------
-    # GPP time series (plot uptake as positive: flip sign for model GPP only)
+    # GPP time series (REddyProc and ANN GPP are positive; multiply by -1 so GPP is negative; isotope GPP is already negative)
     # -----------------------------
     gpp_levels <- c("Tram_GPP", "DT_GPP", "NT_GPP", "GPP_isotope_night0")
     gpp_present <- intersect(gpp_levels, names(usedn_join))
@@ -2588,16 +2641,16 @@ if (file.exists(iso_file) && exists("df_subset_orig")) {
           y     = expression(RECO~(mu*mol~CO[2]~m^{-2}~s^{-1})),
           color = NULL
         ) +
-        theme_minimal() +
+        theme_minimal(base_size = gcb_base) +
         theme(legend.position = "bottom")
       
       print(p_ts_reco)
       
       ggsave(
-        filename = here::here("figures", "USEDN_Timeseries_RECO_Tram_NT_DT_Isotope.png"),
+        filename = fig_file("usedn_reco_ts"),
         plot = p_ts_reco,
-        width = 10, height = 4,
-        dpi = 300, bg = "white"
+        width = gcb_full, height = 75, units = "mm",
+        dpi = gcb_dpi, bg = "white"
       )
     }
   }
@@ -2654,7 +2707,7 @@ if (length(gpp_present) > 1) {
   gpp_diurnal <- usedn_join %>%
     pivot_longer(all_of(gpp_present), names_to = "series", values_to = "flux") %>%
     mutate(
-      # Flip sign for model-based GPP only
+      # REddyProc and ANN GPP are positive: multiply by -1 so GPP is negative (isotope GPP is already negative)
       flux = if_else(series %in% c("Tram_GPP", "NT_GPP", "DT_GPP"), -flux, flux),
       key  = recode(series, !!!gpp_key),
       key  = factor(key, levels = c("ANNBEST", "Daytime", "Nighttime", "Isotope"))
@@ -2679,7 +2732,7 @@ if (length(gpp_present) > 1) {
     ) +
     scale_x_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
     labs(
-      x = "Time of day",
+      x = "Hour of day",
       y = expression(GPP~(mu*mol~CO[2]~m^{-2}~s^{-1}))
     ) +
     theme_minimal() +
@@ -2746,17 +2799,17 @@ if (length(reco_present) > 1) {
     ) +
     scale_x_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
     labs(
-      x = "Time of day",
+      x = "Hour of day",
       y = expression(RECO~(mu*mol~CO[2]~m^{-2}~s^{-1}))
     ) +
-    theme_minimal() +
+    theme_minimal(base_size = gcb_base) +
     theme(legend.position = "bottom")
   
   print(p_reco)
   
   ggsave(
-    filename = here::here("figures", "USEDN_Diurnal_RECO_Tram_NT_DT_Isotope.png"),
-    plot = p_reco, width = 8, height = 6, dpi = 300, bg = "white"
+    filename = fig_file("usedn_diurnal_reco"),
+    plot = p_reco, width = gcb_mid, height = 90, units = "mm", dpi = gcb_dpi, bg = "white"
   )
 }
 ```
@@ -2834,6 +2887,13 @@ var_labeller <- as_labeller(
 # -------------------------
 # 2) Plot
 # -------------------------
+# Bold panel letters inside each panel (strips are used as y-axis labels here)
+iso_levels <- levels(diurnal_iso_env$Variable)
+iso_tags <- data.frame(
+  Variable = factor(iso_levels, levels = iso_levels),
+  label    = sprintf("(%s)", letters[seq_along(iso_levels)])
+)
+
 p_iso_env <- ggplot(diurnal_iso_env, aes(x = tod, y = mean_value)) +
   geom_ribbon(aes(ymin = mean_value - sd_value, ymax = mean_value + sd_value),
               fill = "grey70", alpha = 0.4, color = NA, na.rm = TRUE) +
@@ -2842,18 +2902,21 @@ p_iso_env <- ggplot(diurnal_iso_env, aes(x = tod, y = mean_value)) +
              color = "grey40", linewidth = 0.4) +
   facet_wrap(~ Variable, scales = "free_y", ncol = 3,
              labeller = var_labeller, strip.position = "left") +
+  geom_text(data = iso_tags, aes(x = -Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = -0.3, vjust = 1.4,
+            fontface = "bold", size = gcb_base / ggplot2::.pt) +
   scale_x_continuous(breaks = seq(0, 24, by = 6), limits = c(0, 24)) +
   labs(title = NULL, x = "Hour of day", y = NULL) +
-  theme_minimal(base_size = 11) +
+  theme_minimal(base_size = gcb_base) +
   theme(panel.grid.minor  = element_blank(),
-        strip.text.y.left = element_text(size = 10, angle = 90),
+        strip.text.y.left = element_text(size = gcb_base, angle = 90),
         strip.placement   = "outside",
         axis.title.y      = element_blank())
 
 print(p_iso_env)
 
-ggsave(here::here("figures", "USEDN_Isotope_Period_Diurnal_EnvDrivers.png"),
-       p_iso_env, width = 10, height = 9, dpi = 300, bg = "white")
+ggsave(fig_file("usedn_iso_env"),
+       p_iso_env, width = gcb_full, height = 160, units = "mm", dpi = gcb_dpi, bg = "white")
 
 # Hour of day at which each driver peaks (for the midday depression argument)
 peak_tod <- diurnal_iso_env %>%
