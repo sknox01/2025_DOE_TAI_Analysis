@@ -9,10 +9,14 @@
 # RStudio project files
 .Rproj.user/
 
-# Data files
-*.csv
-
 # figures and large outputs
 *.pdf
 *.png
 *.jpg
+
+# Generated outputs (recreated when the scripts are run)
+figures/
+output/
+
+# Knitted Rmd output
+code/*.html

@@ -67,6 +67,8 @@ fig_names <- c(
   usedn_iso_env       = "Figure_S9"   # US-EDN drivers during isotope campaign
 )
 fig_file <- function(key) here::here("figures", paste0(fig_names[[key]], ".png"))
+dir.create(here::here("figures"), showWarnings = FALSE)
+dir.create(here::here("output"),  showWarnings = FALSE)
 
 # --- GCB figure requirements (applied to every manuscript and SI figure) ---
 # * >= 300 dpi; no figure number or title on the figure; no white border
